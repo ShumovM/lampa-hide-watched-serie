@@ -1206,7 +1206,7 @@ checkAsync('F12', 'Нет бесконечного цикла: вставка с
     return [env.badges(), env.pending.length];
 });
 
-checkAsync('F13', 'Широкие карточки и стиль: плашка есть, стиль один, поверх постера, не над названием', [1, true, true], async () => {
+checkAsync('F13', 'Стиль: плашка в правом верхнем углу постера (и у широких карточек), внутри .card__view', [1, true, true], async () => {
     const env = await domEnv();
 
     env.win.HideWatchedSeries.setMovieWatched(movie(), true);
@@ -1216,7 +1216,35 @@ checkAsync('F13', 'Широкие карточки и стиль: плашка �
     const css = env.document.getElementById('hws-style').textContent;
     const badge = env.document.querySelector('.hws-watched-badge');
 
-    return [env.badges(), /\.card--wide \.hws-watched-badge\{top/.test(css), badge.parentNode.className === 'card__view'];
+    return [env.badges(), /\.hws-watched-badge\{position:absolute;top:\.5em;right:\.5em;/.test(css) && css.indexOf('bottom:') === -1, badge.parentNode.className === 'card__view'];
+});
+
+checkAsync('F14', 'Значки закладок вверху: плашка опускается под них, без значков — в самом углу; следит за изменениями', [false, true, false, 1], async () => {
+    const env = await domEnv();
+    const el = env.makeCard(movie());
+    const badge = () => el.querySelector('.hws-watched-badge');
+    const low = () => badge().className.indexOf('hws-watched-badge--low') !== -1;
+
+    env.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    env.line().appendChild(el);
+    await env.tick();
+
+    const plain = low();
+
+    // Lampa добавила значок «Избранное» (card/module/favorite.js → addicon)
+    const icon = env.document.createElement('div');
+
+    icon.className = 'card__icon icon--book';
+    el.querySelector('.card__icons-inner').appendChild(icon);
+    await env.tick();
+
+    const withIcon = low();
+
+    // значки очищены (innerHTML = '') — новых узлов нет, только удаление
+    el.querySelector('.card__icons-inner').innerHTML = '';
+    await env.tick();
+
+    return [plain, withIcon, low(), el.querySelectorAll('.hws-watched-badge').length];
 });
 
 /* ---------------- Отчёт ---------------- */

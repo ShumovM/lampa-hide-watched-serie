@@ -1497,7 +1497,32 @@
 
             if (!view) return;
 
-            syncBadge(view, isMovieCard(card) && isMovieWatched(card));
+            var show = isMovieCard(card) && isMovieWatched(card);
+
+            syncBadge(view, show);
+
+            if (!show) return;
+
+            // Значки закладок Lampa (.card__icons) стоят вверху по центру: при них плашка опускается под них
+            var inner = el.querySelector('.card__icons-inner');
+            var low = Boolean(inner && inner.children && inner.children.length);
+            var badge = null;
+
+            for (var i = 0; i < view.childNodes.length && !badge; i++) {
+                if (hasClass(view.childNodes[i], BADGE_CLASS)) badge = view.childNodes[i];
+            }
+
+            var className = BADGE_CLASS + (low ? ' ' + BADGE_CLASS + '--low' : '');
+
+            if (badge && badge.className !== className) badge.className = className;
+        }
+
+        function closestCard(node) {
+            for (var n = node; n && n.nodeType === 1; n = n.parentNode) {
+                if (hasClass(n, 'card')) return n;
+            }
+
+            return null;
         }
 
         function scanBadges(root) {
@@ -1536,13 +1561,23 @@
                     if (j !== i && roots[j] !== roots[i] && roots[j].contains && roots[j].contains(roots[i])) inside = true;
                 }
 
-                if (!inside && roots.indexOf(roots[i]) === i) scanBadges(roots[i]);
+                if (inside || roots.indexOf(roots[i]) !== i) continue;
+
+                // Изменение внутри карточки (например, значки закладок) — обновить саму карточку
+                var card = hasClass(roots[i], 'card') ? null : closestCard(roots[i].parentNode);
+
+                if (card) applyCardBadge(card);
+                else scanBadges(roots[i]);
             }
         }
 
         function onMutations(mutations) {
             for (var i = 0; i < mutations.length; i++) {
                 var added = mutations[i].addedNodes || [];
+                var target = mutations[i].target;
+
+                // Значки закладок могли только убрать (innerHTML = ''): тогда новых узлов нет
+                if (target && hasClass(target, 'card__icons-inner')) badgeRoots.push(target);
 
                 for (var j = 0; j < added.length; j++) {
                     var node = added[j];
@@ -1566,13 +1601,14 @@
 
             style.id = 'hws-style';
             style.textContent = [
-                // Над рейтингом .card__vote (низ постера справа), не над названием и иконками закладок
-                '.' + BADGE_CLASS + '{position:absolute;right:.4em;bottom:3.3em;z-index:2;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;',
+                // Правый верхний угол постера: внизу справа рейтинг .card__vote, слева сверху метка типа
+                '.' + BADGE_CLASS + '{position:absolute;top:.5em;right:.5em;z-index:2;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;',
                 'padding:.3em .6em .3em .45em;-webkit-border-radius:1em;border-radius:1em;background:#1f9d5c;background:-webkit-linear-gradient(top,#2ec27a,#178a4e);background:linear-gradient(to bottom,#2ec27a,#178a4e);',
                 'color:#fff;font-size:.8em;font-weight:600;line-height:1.2;white-space:nowrap;-webkit-box-shadow:0 .15em .6em rgba(0,0,0,.4);box-shadow:0 .15em .6em rgba(0,0,0,.4);pointer-events:none}',
                 '.' + BADGE_CLASS + ' svg{width:1.05em;height:1.05em;margin-right:.35em;-webkit-flex-shrink:0;flex-shrink:0}',
-                '.card--wide .' + BADGE_CLASS + '{top:.6em;bottom:auto}',
-                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.8em;right:.8em;bottom:auto;font-size:1em}',
+                // .card__icons: top .9em + значок ~1.8em (в em карточки) → ниже на ~3.9em шрифта плашки
+                '.' + BADGE_CLASS + '--low{top:3.9em}',
+                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.8em;right:.8em;font-size:1em}',
                 '.button--hws-movie.hws-movie--on svg{color:#2ec27a}'
             ].join('');
 

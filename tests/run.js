@@ -970,7 +970,276 @@ check('C2', 'shouldHide: результат старше 7 дней не исп�
 
 check('C3', 'parseAirDate: некорректные даты → NaN', [true, true, true], () => [isNaN(Core.parseAirDate('')), isNaN(Core.parseAirDate(null)), isNaN(Core.parseAirDate('soon'))]);
 
+/* ---------------- Отметка «Просмотрено» для фильмов ---------------- */
+
+const asyncChecks = [];
+
+function checkAsync(id, title, expected, fn) {
+    asyncChecks.push({ id, title, expected, fn });
+}
+
+const MOVIE = { id: 27205, source: 'tmdb', title: 'Начало', original_title: 'Inception', release_date: '2010-07-15', vote_average: 8.4 };
+const movie = (extra) => Object.assign({}, MOVIE, extra || {});
+
+async function domEnv(opts) {
+    const env = createEnv(Object.assign({ dom: true }, opts || {}));
+
+    env.install();
+    env.flush();
+
+    return env;
+}
+
+checkAsync('F1', 'Фильм без отметки — плашки нет', [0, false], async () => {
+    const env = await domEnv();
+
+    env.line().appendChild(env.makeCard(movie()));
+    await env.tick();
+
+    return [env.badges(), env.win.HideWatchedSeries.isMovieWatched(movie())];
+});
+
+checkAsync('F2', 'Кнопка на странице фильма ставит отметку: плашка на постере и в каталоге, подпись меняется', [true, 1, 1, 'Снять отметку «Просмотрено»', 'Фильм отмечен как просмотренный', 'Просмотрено'], async () => {
+    const env = await domEnv();
+
+    env.line().appendChild(env.makeCard(movie()));
+    await env.tick();
+
+    const page = env.openMovie(movie());
+
+    page.press();
+    await env.tick();
+
+    const badge = env.document.querySelector('.card .hws-watched-badge');
+
+    return [env.win.HideWatchedSeries.isMovieWatched(movie()), env.badges(env.document.querySelector('.items-line')), page.posterBadges(), page.label(), env.noty[env.noty.length - 1], badge && badge.textContent];
+});
+
+checkAsync('F3', 'Повторное нажатие снимает отметку: плашки убраны, запись удалена из хранилища', [false, 0, 0, 'Отметить просмотренным', 'Отметка «Просмотрено» снята', {}], async () => {
+    const env = await domEnv();
+
+    env.line().appendChild(env.makeCard(movie()));
+
+    const page = env.openMovie(movie());
+
+    page.press();
+    await env.tick();
+    page.press();
+    await env.tick();
+
+    return [env.win.HideWatchedSeries.isMovieWatched(movie()), env.badges(), page.posterBadges(), page.label(), env.noty[env.noty.length - 1], JSON.parse(env.ls.getItem('hws_movies_watched')).items];
+});
+
+checkAsync('F4', 'Отметка сохраняется после перезапуска (новая инициализация с тем же localStorage)', [true, 1, 'Снять отметку «Просмотрено»'], async () => {
+    const first = await domEnv();
+
+    first.win.HideWatchedSeries.setMovieWatched(movie(), true);
+
+    const env = await domEnv({ localStorage: first.ls });
+
+    env.line().appendChild(env.makeCard(movie()));
+    await env.tick();
+
+    return [env.win.HideWatchedSeries.isMovieWatched(movie()), env.badges(), env.openMovie(movie()).label()];
+});
+
+checkAsync('F5', 'Одинаковые названия, разные id и источники не смешиваются; cub и tmdb — один фильм', [['tmdb_27205'], false, true, false, 1], async () => {
+    const env = await domEnv();
+    const api = env.win.HideWatchedSeries;
+    const twin = movie({ id: 99999 });
+    const ivi = movie({ source: 'ivi' });
+    const line = env.line();
+
+    api.setMovieWatched(movie(), true);
+    [movie(), twin, ivi].forEach((c) => line.appendChild(env.makeCard(c)));
+    await env.tick();
+
+    return [Object.keys(JSON.parse(env.ls.getItem('hws_movies_watched')).items), api.isMovieWatched(twin), api.isMovieWatched(movie({ source: 'cub' })), api.isMovieWatched(ivi), env.badges()];
+});
+
+checkAsync('F6', 'Сериалы и персоны не получают отметку фильма, на странице сериала нет кнопки фильма', [0, null, false, 0, null], async () => {
+    const env = await domEnv();
+    const api = env.win.HideWatchedSeries;
+    const tv = { id: 27205, source: 'tmdb', name: 'Сериал', original_name: 'Show', title: 'Сериал', original_title: 'Show', first_air_date: '2020-01-01', number_of_seasons: 1 };
+    const person = { id: 27205, source: 'tmdb', name: 'Актёр', title: 'Актёр', gender: 2, profile_path: '/a.jpg' };
+    // сериал без original_name (другой источник): признак — number_of_seasons
+    const tvBare = { id: 27205, source: 'tmdb', title: 'Начало', original_title: 'Inception', number_of_seasons: 2 };
+
+    api.setMovieWatched(movie(), true);
+
+    const line = env.line();
+
+    line.appendChild(env.makeCard(tv));
+    line.appendChild(env.makeCard(person));
+    line.appendChild(env.makeCard(tvBare));
+    await env.tick();
+
+    const page = env.openMovie(tv);
+
+    return [env.badges(), api.setMovieWatched(tvBare, true), api.isMovieWatched(tv), page.root.querySelectorAll('.button--hws-movie').length, api.setMovieWatched(person, true)];
+});
+
+checkAsync('F7', 'Повторный рендер карточки и повторные проходы не дублируют плашки', [1, 1, 1, 2], async () => {
+    const env = await domEnv();
+    const api = env.win.HideWatchedSeries;
+    const line = env.line();
+    const el = env.makeCard(movie());
+
+    api.setMovieWatched(movie(), true);
+    line.appendChild(el);
+    await env.tick();
+    api.scanBadges();
+    api.scanBadges();
+
+    const once = el.querySelectorAll('.hws-watched-badge').length;
+
+    // карточку убрали и вставили снова (перерисовка строки)
+    line.removeChild(el);
+    line.appendChild(el);
+    await env.tick();
+
+    const again = el.querySelectorAll('.hws-watched-badge').length;
+
+    // лишняя плашка (например, от другого кода) схлопывается до одной
+    el.querySelector('.card__view').appendChild(el.querySelector('.hws-watched-badge').cloneNode(true));
+    api.scanBadges();
+
+    const collapsed = el.querySelectorAll('.hws-watched-badge').length;
+
+    // новая карточка того же фильма — своя плашка
+    line.appendChild(env.makeCard(movie()));
+    await env.tick();
+
+    return [once, again, collapsed, env.badges()];
+});
+
+checkAsync('F8', 'Прокрутка (подгрузка карточек) и смена раздела: плашки появляются, обработчики не дублируются', [2, 1, 1, 1], async () => {
+    const env = await domEnv();
+    const api = env.win.HideWatchedSeries;
+    const a = movie({ id: 1 });
+    const b = movie({ id: 2 });
+
+    api.setMovieWatched(a, true);
+    api.setMovieWatched(b, true);
+
+    // повторная загрузка плагина в то же окно
+    delete require.cache[require.resolve('../hide_watched_series.js')];
+    require('../hide_watched_series.js').install(env.win);
+
+    const line = env.line();
+
+    // прокрутка: карточки подгружаются порциями
+    line.appendChild(env.makeCard(movie({ id: 3 })));
+    await env.tick();
+    line.appendChild(env.makeCard(a));
+    line.appendChild(env.makeCard(b));
+    await env.tick();
+
+    const afterScroll = env.badges();
+
+    // смена раздела: старая страница удалена, новая построена целиком
+    env.document.querySelector('.activitys').innerHTML = '';
+
+    const section = env.document.createElement('div');
+
+    section.className = 'activity';
+    section.innerHTML = '<div class="items-line"><div class="scroll__body"></div></div>';
+    section.querySelector('.scroll__body').appendChild(env.makeCard(a));
+    env.document.querySelector('.activitys').appendChild(section);
+    await env.tick();
+
+    return [afterScroll, env.badges(), env.document.querySelectorAll('#hws-style').length, env.Lampa.Listener.count('full')];
+});
+
+checkAsync('F9', 'Повреждённые данные хранилища игнорируются, отметка затем работает', [false, false, true, 1], async () => {
+    const { memoryStorage } = require('./harness');
+    const broken = await domEnv({ localStorage: memoryStorage({ hws_movies_watched: '{broken' }) });
+    const wrongShape = await domEnv({ localStorage: memoryStorage({ hws_movies_watched: JSON.stringify({ v: 1, items: [{ id: 27205 }] }) }) });
+    const a = broken.win.HideWatchedSeries.isMovieWatched(movie());
+    const b = wrongShape.win.HideWatchedSeries.isMovieWatched(movie());
+
+    broken.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    broken.line().appendChild(broken.makeCard(movie()));
+    await broken.tick();
+
+    return [a, b, JSON.parse(broken.ls.getItem('hws_movies_watched')).items.tmdb_27205 !== undefined, broken.badges()];
+});
+
+checkAsync('F10', 'Ошибка записи в localStorage: состояние не меняется, сообщение об ошибке', [false, 'Не удалось сохранить отметку', 0], async () => {
+    const env = await domEnv();
+
+    env.ls.setItem = () => { throw new Error('QuotaExceededError'); };
+
+    const page = env.openMovie(movie());
+
+    page.press();
+    await env.tick();
+
+    return [env.win.HideWatchedSeries.isMovieWatched(movie()), env.noty[env.noty.length - 1], page.posterBadges()];
+});
+
+checkAsync('F11', 'Отметка фильма не трогает сериалы: история, кеш и «Продолжить просмотр» без изменений', [['Series A'], 0, false], async () => {
+    const env = await domEnv();
+    const s = env.addShow(4001, 'Series A', [{ n: 1, eps: [-30, -20] }]);
+
+    env.watch(s.card, 1, 1, 100);
+
+    const before = settle(env);
+    const cacheBefore = JSON.stringify(env.win.HideWatchedSeries.cache());
+
+    env.updates.length = 0;
+    env.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    await env.tick();
+
+    return [env.continueTitles().filter((t) => before.indexOf(t) >= 0), env.updates.length, JSON.stringify(env.win.HideWatchedSeries.cache()) !== cacheBefore];
+});
+
+checkAsync('F12', 'Нет бесконечного цикла: вставка своих плашек не запускает новые проходы', [1, 0], async () => {
+    const env = await domEnv();
+
+    env.line().appendChild(env.makeCard(movie()));
+    await env.tick();
+    env.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    await env.tick();
+    await env.tick();
+
+    return [env.badges(), env.pending.length];
+});
+
+checkAsync('F13', 'Широкие карточки и стиль: плашка есть, стиль один, поверх постера, не над названием', [1, true, true], async () => {
+    const env = await domEnv();
+
+    env.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    env.line().appendChild(env.makeCard(movie(), 'card--wide'));
+    await env.tick();
+
+    const css = env.document.getElementById('hws-style').textContent;
+    const badge = env.document.querySelector('.hws-watched-badge');
+
+    return [env.badges(), /\.card--wide \.hws-watched-badge\{top/.test(css), badge.parentNode.className === 'card__view'];
+});
+
 /* ---------------- Отчёт ---------------- */
+async function runAsyncChecks() {
+    for (const c of asyncChecks) {
+        let actual;
+
+        try {
+            actual = await c.fn();
+        } catch (e) {
+            actual = 'EXCEPTION: ' + e.message;
+        }
+
+        const exp = JSON.stringify(c.expected);
+        const act = JSON.stringify(actual);
+
+        results.push({ id: c.id, title: c.title, expected: exp, actual: act, pass: exp === act });
+    }
+}
+
+runAsyncChecks().then(report);
+
+function report() {
 const passed = results.filter((r) => r.pass).length;
 const failed = results.length - passed;
 const lines = [];
@@ -999,3 +1268,4 @@ results.forEach((r) => {
 console.log('\nВсего: ' + results.length + ', успешно: ' + passed + ', неуспешно: ' + failed);
 
 process.exit(failed ? 1 : 0);
+}

@@ -489,6 +489,73 @@ function createEnv(opts) {
     env.Lampa = Lampa;
     env.noty = [];
 
+    // Настоящий DOM (jsdom + jQuery) для карточек каталога и плашек
+    if (opts.dom) {
+        const { JSDOM } = require('jsdom');
+        const dom = new JSDOM('<!doctype html><html><head></head><body><div class="activitys"></div></body></html>');
+
+        env.window = dom.window;
+        env.document = dom.window.document;
+        win.document = dom.window.document;
+        win.MutationObserver = dom.window.MutationObserver;
+        win.$ = require('jquery')(dom.window);
+
+        // Дождаться MutationObserver (микрозадача) и выполнить отложенные задачи плагина
+        env.tick = async function () {
+            await new Promise((r) => setTimeout(r, 0));
+            env.flush();
+        };
+
+        // Разметка карточки Lampa (templates/card.js); card_data ставится до вставки, как в card/module/card.js
+        env.makeCard = function (card, extraClass) {
+            const el = env.document.createElement('div');
+
+            el.className = 'card selector layer--visible layer--render' + (extraClass ? ' ' + extraClass : '');
+            el.innerHTML = '<div class="card__view"><img class="card__img"><div class="card__icons"><div class="card__icons-inner"></div></div><div class="card__vote">7.5</div></div><div class="card__title"></div><div class="card__age"></div>';
+            el.querySelector('.card__title').textContent = card.title || card.name || '';
+            el.card_data = card;
+
+            return el;
+        };
+
+        env.line = function () {
+            const line = env.document.createElement('div');
+
+            line.className = 'items-line';
+            line.innerHTML = '<div class="items-line__body"><div class="scroll__body"></div></div>';
+            env.document.querySelector('.activitys').appendChild(line);
+
+            return line.querySelector('.scroll__body');
+        };
+
+        env.badges = function (root) {
+            return (root || env.document).querySelectorAll('.hws-watched-badge').length;
+        };
+
+        // Страница фильма с разметкой full_start_new и событием full → complite
+        env.openMovie = function (card) {
+            const root = env.document.createElement('div');
+
+            root.className = 'full-start-new';
+            root.innerHTML = '<div class="full-start-new__poster"><img class="full-start-new__img"></div><div class="full-start-new__buttons"><div class="full-start__button selector button--play"><span>Смотреть</span></div><div class="full-start__button selector button--book"><span>Избранное</span></div></div>';
+            env.document.querySelector('.activitys').appendChild(root);
+
+            const $root = win.$(root);
+            const activity = { render: () => $root };
+
+            Lampa.Listener.send('full', { type: 'complite', object: { activity }, data: { movie: card } });
+
+            return {
+                root,
+                button: () => root.querySelector('.button--hws-movie'),
+                label: () => root.querySelector('.button--hws-movie span').textContent,
+                press: () => win.$(root.querySelector('.button--hws-movie')).trigger('hover:enter'),
+                posterBadges: () => root.querySelector('.full-start-new__poster').querySelectorAll('.hws-watched-badge').length,
+                close: () => root.parentNode.removeChild(root)
+            };
+        };
+    }
+
     // Стек страниц: главная/«Сериалы» под открытой страницей сериала
     env.pushActivity = function (component) {
         const item = { component, refreshed: 0, activity: { refresh() { item.refreshed++; } } };

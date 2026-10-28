@@ -9,6 +9,8 @@
     "serve": "node tests/integration/serve.js"
   },
   "devDependencies": {
-    "acorn": "8.14.0"
+    "acorn": "8.14.0",
+    "jquery": "3.7.1",
+    "jsdom": "24.1.3"
   }
 }

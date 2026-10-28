@@ -1,10 +1,11 @@
 /*!
  * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
- * Версия 1.1.0
+ * Версия 1.2.0
  *
  * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
  * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
  * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными».
+ * На странице фильма — кнопку «Отметить просмотренным» и зелёную плашку на постере.
  *
  * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
  * ветка 3.x, где строка строится через Lampa.ContentRows.
@@ -14,7 +15,7 @@
 (function (root) {
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
     var LOG_TAG = 'HideWatched';
 
     var CACHE_KEY = 'hws_cache';
@@ -1291,8 +1292,9 @@
 
             try {
                 var movie = e.data && e.data.movie;
+                var series = markable(movie);
 
-                if (!markable(movie)) return;
+                if (!series && !isMovieCard(movie)) return;
 
                 var render = null;
 
@@ -1304,6 +1306,9 @@
 
                 if (!container.length) container = render.find('.full-start__buttons');
                 if (!container.length) return log('mark button: no buttons container');
+
+                if (!series) return addMovieButton(movie, render, container);
+
                 if (container.find('.button--hws-mark').length) return;
 
                 var jq = win.$ || win.jQuery;
@@ -1324,6 +1329,346 @@
             } catch (err) {
                 log('mark button error', err && err.message);
             }
+        }
+
+        /* ---------- отметка «Просмотрено» для фильмов ---------- */
+
+        // Своё хранилище: штатная метка viewed в 3.x доступна в меню только с CUB Premium,
+        // взаимоисключающая со «Смотрю» и убирает фильм из строки «Вы смотрели»
+        var MOVIES_KEY = 'hws_movies_watched';
+        var MOVIES_VERSION = 1;
+        var BADGE_CLASS = 'hws-watched-badge';
+        var BADGE_TEXT = 'Просмотрено';
+        var MOVIE_MARK_LABEL = 'Отметить просмотренным';
+        var MOVIE_UNMARK_LABEL = 'Снять отметку «Просмотрено»';
+        var CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.5 12.5l5 5 10-11" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        var movieMarks = null;
+        var badgeObserver = null;
+        var badgeRoots = [];
+        var badgeTimer = null;
+
+        function hasClass(el, name) {
+            return Boolean(el && typeof el.className === 'string' && (' ' + el.className + ' ').indexOf(' ' + name + ' ') !== -1);
+        }
+
+        /**
+         * Фильм: не сериал, есть название фильма, не персона.
+         * У сериалов из TMDB есть original_name/first_air_date, у персон — gender
+         */
+        function isMovieCard(card) {
+            if (!card || typeof card !== 'object' || isTvCard(card)) return false;
+            if (card.original_name || typeof card.gender !== 'undefined' || card.known_for_department) return false;
+            if (!(card.title || card.original_title)) return false;
+
+            return movieKey(card) !== null;
+        }
+
+        /**
+         * Стабильный ключ фильма: источник + id. cub отдаёт id TMDB, поэтому
+         * cub и tmdb дают один ключ; у остальных источников свой префикс
+         */
+        function movieKey(card) {
+            if (!card || card.id === null || typeof card.id === 'undefined') return null;
+
+            var id = (card.id + '').replace(/[^\w.-]/g, '');
+
+            if (!id) return null;
+
+            var source = ((card.source || 'tmdb') + '').toLowerCase().replace(/[^\w-]/g, '');
+
+            if (!source || source === 'cub') source = 'tmdb';
+
+            return source + '_' + id;
+        }
+
+        function loadMovieMarks() {
+            if (movieMarks) return movieMarks;
+
+            movieMarks = {};
+
+            try {
+                var ls = storage();
+                var raw = ls ? ls.getItem(MOVIES_KEY) : null;
+                var parsed = raw ? JSON.parse(raw) : null;
+
+                if (parsed && parsed.v === MOVIES_VERSION && parsed.items && typeof parsed.items === 'object' && !isArray(parsed.items)) {
+                    for (var key in parsed.items) {
+                        if (Object.prototype.hasOwnProperty.call(parsed.items, key) && parsed.items[key] && typeof parsed.items[key] === 'object') movieMarks[key] = parsed.items[key];
+                    }
+                } else if (raw) {
+                    log('movie marks: unreadable data ignored');
+                }
+            } catch (e) {
+                log('movie marks: broken data ignored', e && e.message);
+                movieMarks = {};
+            }
+
+            return movieMarks;
+        }
+
+        function saveMovieMarks() {
+            try {
+                var ls = storage();
+
+                if (ls) ls.setItem(MOVIES_KEY, JSON.stringify({ v: MOVIES_VERSION, items: loadMovieMarks() }));
+
+                return true;
+            } catch (e) {
+                log('movie marks save error', e && e.message);
+
+                return false;
+            }
+        }
+
+        function isMovieWatched(card) {
+            if (!isMovieCard(card)) return false;
+
+            return Object.prototype.hasOwnProperty.call(loadMovieMarks(), movieKey(card));
+        }
+
+        /**
+         * Поставить или снять отметку. Возвращает новое состояние
+         * или null, если это не фильм либо запись не удалась
+         */
+        function setMovieWatched(card, watched) {
+            if (!isMovieCard(card)) return null;
+
+            var marks = loadMovieMarks();
+            var key = movieKey(card);
+            var before = marks[key];
+
+            if (watched) marks[key] = { t: clock(), title: card.title || card.original_title };
+            else delete marks[key];
+
+            if (!saveMovieMarks()) {
+                if (before) marks[key] = before;
+                else delete marks[key];
+
+                return null;
+            }
+
+            log('movie', key, card.title || card.original_title, '→', watched ? 'watched' : 'unmarked');
+
+            updateBadges();
+
+            return Boolean(watched);
+        }
+
+        function toggleMovieWatched(card) {
+            return setMovieWatched(card, !isMovieWatched(card));
+        }
+
+        function doc() {
+            return win.document || null;
+        }
+
+        function createBadge() {
+            var badge = doc().createElement('div');
+
+            badge.className = BADGE_CLASS;
+            badge.innerHTML = CHECK_ICON + '<span>' + BADGE_TEXT + '</span>';
+
+            return badge;
+        }
+
+        /**
+         * Плашка в контейнере постера: добавить или убрать. Идемпотентно,
+         * поэтому повторная отрисовка карточки не создаёт дублей
+         */
+        function syncBadge(view, show) {
+            if (!view) return;
+
+            var existing = [];
+
+            for (var i = 0; i < view.childNodes.length; i++) {
+                if (hasClass(view.childNodes[i], BADGE_CLASS)) existing.push(view.childNodes[i]);
+            }
+
+            if (show && !existing.length) view.appendChild(createBadge());
+
+            for (var j = show ? 1 : 0; j < existing.length; j++) view.removeChild(existing[j]);
+        }
+
+        function applyCardBadge(el) {
+            if (!el || !hasClass(el, 'card')) return;
+
+            var card = el.card_data;
+            var view = el.querySelector ? el.querySelector('.card__view') : null;
+
+            if (!view) return;
+
+            syncBadge(view, isMovieCard(card) && isMovieWatched(card));
+        }
+
+        function scanBadges(root) {
+            try {
+                root = root || (doc() && doc().body);
+
+                if (!root || root.nodeType !== 1) return;
+
+                applyCardBadge(root);
+
+                var cards = root.querySelectorAll ? root.querySelectorAll('.card') : [];
+
+                for (var i = 0; i < cards.length; i++) applyCardBadge(cards[i]);
+            } catch (e) {
+                log('badge scan error', e && e.message);
+            }
+        }
+
+        function updateBadges() {
+            scanBadges();
+            updateFullPoster();
+        }
+
+        function flushBadgeRoots() {
+            badgeTimer = null;
+
+            var roots = badgeRoots;
+
+            badgeRoots = [];
+
+            for (var i = 0; i < roots.length; i++) {
+                // Узел мог оказаться внутри уже обработанного корня
+                var inside = false;
+
+                for (var j = 0; j < roots.length && !inside; j++) {
+                    if (j !== i && roots[j] !== roots[i] && roots[j].contains && roots[j].contains(roots[i])) inside = true;
+                }
+
+                if (!inside && roots.indexOf(roots[i]) === i) scanBadges(roots[i]);
+            }
+        }
+
+        function onMutations(mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var added = mutations[i].addedNodes || [];
+
+                for (var j = 0; j < added.length; j++) {
+                    var node = added[j];
+
+                    // Свои плашки не обрабатываем: так нет повторных проходов
+                    if (node.nodeType !== 1 || hasClass(node, BADGE_CLASS)) continue;
+
+                    badgeRoots.push(node);
+                }
+            }
+
+            if (badgeRoots.length && !badgeTimer) badgeTimer = timers.set(flushBadgeRoots, 60);
+        }
+
+        function injectBadgeStyle() {
+            var d = doc();
+
+            if (!d || d.getElementById('hws-style')) return;
+
+            var style = d.createElement('style');
+
+            style.id = 'hws-style';
+            style.textContent = [
+                // Над рейтингом .card__vote (низ постера справа), не над названием и иконками закладок
+                '.' + BADGE_CLASS + '{position:absolute;right:.4em;bottom:3.3em;z-index:2;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;',
+                'padding:.3em .6em .3em .45em;-webkit-border-radius:1em;border-radius:1em;background:#1f9d5c;background:-webkit-linear-gradient(top,#2ec27a,#178a4e);background:linear-gradient(to bottom,#2ec27a,#178a4e);',
+                'color:#fff;font-size:.8em;font-weight:600;line-height:1.2;white-space:nowrap;-webkit-box-shadow:0 .15em .6em rgba(0,0,0,.4);box-shadow:0 .15em .6em rgba(0,0,0,.4);pointer-events:none}',
+                '.' + BADGE_CLASS + ' svg{width:1.05em;height:1.05em;margin-right:.35em;-webkit-flex-shrink:0;flex-shrink:0}',
+                '.card--wide .' + BADGE_CLASS + '{top:.6em;bottom:auto}',
+                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.8em;right:.8em;bottom:auto;font-size:1em}',
+                '.button--hws-movie.hws-movie--on svg{color:#2ec27a}'
+            ].join('');
+
+            (d.head || d.body).appendChild(style);
+        }
+
+        function startBadges() {
+            try {
+                var d = doc();
+
+                if (!d || !d.body) return;
+
+                injectBadgeStyle();
+                scanBadges(d.body);
+
+                var Observer = win.MutationObserver || win.WebKitMutationObserver;
+
+                if (Observer) {
+                    badgeObserver = new Observer(onMutations);
+                    badgeObserver.observe(d.body, { childList: true, subtree: true });
+                } else {
+                    // Старые движки без MutationObserver: редкий проход по видимым карточкам
+                    timers.interval(function () {
+                        scanBadges();
+                    }, 2000);
+                }
+
+                log('movie badges started', Observer ? 'observer' : 'interval', 'marked:', Object.keys(loadMovieMarks()).length);
+            } catch (e) {
+                log('movie badges error', e && e.message);
+            }
+        }
+
+        /* Страница фильма: кнопка и плашка на постере */
+
+        var fullPoster = null;
+
+        function updateFullPoster() {
+            if (!fullPoster) return;
+
+            try {
+                var view = fullPoster.view;
+
+                if (!view || !doc().body.contains(view)) {
+                    fullPoster = null;
+
+                    return;
+                }
+
+                var on = isMovieWatched(fullPoster.movie);
+
+                syncBadge(view, on);
+
+                fullPoster.button.toggleClass('hws-movie--on', on);
+                fullPoster.button.find('span').text(on ? MOVIE_UNMARK_LABEL : MOVIE_MARK_LABEL);
+            } catch (e) {
+                log('full poster error', e && e.message);
+            }
+        }
+
+        function addMovieButton(movie, render, container) {
+            if (container.find('.button--hws-movie').length) return;
+
+            var jq = win.$ || win.jQuery;
+            var on = isMovieWatched(movie);
+            var button = jq('<div class="full-start__button selector button--hws-movie' + (on ? ' hws-movie--on' : '') + '">' +
+                '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1.5 12S5.5 4.5 12 4.5 22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12z" stroke="currentColor" stroke-width="2"/><path d="M8.5 12l2.5 2.5 4.5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+                '<span>' + (on ? MOVIE_UNMARK_LABEL : MOVIE_MARK_LABEL) + '</span></div>');
+
+            var poster = render.find('.full-start-new__poster');
+
+            if (!poster.length) poster = render.find('.full-start__poster');
+
+            var page = { movie: movie, button: button, view: poster.length ? poster[0] : null };
+
+            fullPoster = page;
+
+            button.on('hover:enter', function () {
+                // После «Назад» на другую страницу и возврата активна снова эта
+                fullPoster = page;
+
+                var state = toggleMovieWatched(movie);
+
+                if (state === null) return notify('Не удалось сохранить отметку');
+
+                notify(state ? 'Фильм отмечен как просмотренный' : 'Отметка «Просмотрено» снята');
+            });
+
+            var options = container.find('.button--options');
+
+            if (options.length) options.before(button);
+            else container.append(button);
+
+            if (page.view) syncBadge(page.view, on);
+
+            log('movie button added', movieKey(movie), on ? 'watched' : '');
         }
 
         /* ---------- источник списка для фоновой проверки ---------- */
@@ -1605,6 +1950,8 @@
                     if (lampa.Listener && typeof lampa.Listener.follow === 'function') lampa.Listener.follow('full', onFull);
                 } catch (e) {}
 
+                startBadges();
+
                 try {
                     if (lampa.Manifest) {
                         lampa.Manifest.plugins = {
@@ -1671,6 +2018,11 @@
             hideCard: hideCard,
             markAllAired: markAllAired,
             markMessage: markMessage,
+            isMovieWatched: isMovieWatched,
+            setMovieWatched: setMovieWatched,
+            toggleMovieWatched: toggleMovieWatched,
+            movieKey: movieKey,
+            scanBadges: scanBadges,
             cache: function () {
                 return loadCache();
             },

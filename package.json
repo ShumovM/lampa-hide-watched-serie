@@ -1,0 +1,14 @@
+{
+  "name": "lampa-hide-watched-series",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Плагин Lampa: убирает досмотренные сериалы из «Продолжить просмотр» до выхода новой серии",
+  "main": "hide_watched_series.js",
+  "scripts": {
+    "test": "node tests/run.js && node tests/check_es5.js",
+    "serve": "node tests/integration/serve.js"
+  },
+  "devDependencies": {
+    "acorn": "8.14.0"
+  }
+}

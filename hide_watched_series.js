@@ -1,9 +1,10 @@
 /*!
  * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
- * Версия 1.0.0
+ * Версия 1.1.0
  *
  * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
  * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
+ * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными».
  *
  * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
  * ветка 3.x, где строка строится через Lampa.ContentRows.
@@ -13,7 +14,7 @@
 (function (root) {
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
     var LOG_TAG = 'HideWatched';
 
     var CACHE_KEY = 'hws_cache';
@@ -454,6 +455,7 @@
         var originalContinues = null;
         var warmupTimer = null;
         var stats = { hidden: 0, checks: 0, errors: 0 };
+        var marking = null;
 
         function L() {
             return win.Lampa;
@@ -937,6 +939,393 @@
             }
         }
 
+        /* ---------- массовая отметка вышедших серий ---------- */
+
+        var MARK_LABEL = 'Отметить все вышедшие серии просмотренными';
+        // Сколько серий записывать за один проход, чтобы не подвешивать интерфейс ТВ
+        var MARK_CHUNK = 20;
+
+        function markable(card) {
+            if (!card || !isTvCard(card)) return false;
+            if (typeof card.id !== 'number' && !/^\d+$/.test(card.id + '')) return false;
+            if (card.source && card.source !== 'tmdb' && card.source !== 'cub') return false;
+
+            return titleCandidates(card).length > 0;
+        }
+
+        /**
+         * Названия для хеша серии, как их использует Lampa: original_title
+         * (торренты 2.3.0/3.x, онлайн-плагины; у сериала Lampa копирует туда
+         * original_name), затем original_name (карточки серий 3.x), если отличается
+         */
+        function markTitles(card) {
+            var list = [];
+            var primary = card.original_title || card.original_name;
+
+            if (primary) list.push(primary);
+            if (card.original_name && list.indexOf(card.original_name) === -1) list.push(card.original_name);
+
+            return list;
+        }
+
+        /**
+         * Привязка прогресса к карточке (Lampa 3.x). В 2.3.0 Timeline.link нет — null
+         */
+        function episodeLink(card, season, episode) {
+            try {
+                var timeline = L().Timeline;
+
+                if (timeline && typeof timeline.link === 'function') return timeline.link(card, season, episode) || null;
+            } catch (e) {}
+
+            return null;
+        }
+
+        /**
+         * Отметить серию досмотренной в истории Lampa: Timeline.view + Timeline.update,
+         * как это делают торренты и отметка серии в самой Lampa.
+         * @returns {string} 'marked' или 'already'
+         */
+        function markEpisode(card, season, episode, limit) {
+            var timeline = L().Timeline;
+            var link = episodeLink(card, season, episode);
+            var titles = markTitles(card);
+            var views = [];
+            var best = 0;
+
+            for (var i = 0; i < titles.length; i++) {
+                var hashValue = hash(episodeKey(season, episode, titles[i]));
+                var view = timeline.view(hashValue, link) || {};
+                var percent = parseFloat(view.percent);
+
+                if (!isNaN(percent)) best = Math.max(best, percent);
+
+                views.push({ hash: hashValue, view: view });
+            }
+
+            // Досмотренную серию не трогаем: её время, длительность и дата остаются прежними
+            if (best >= limit) return 'already';
+
+            for (var j = 0; j < views.length; j++) {
+                var current = views[j].view;
+                var duration = parseFloat(current.duration) > 0 ? parseFloat(current.duration) : 0;
+                var params = {
+                    hash: views[j].hash,
+                    percent: 100,
+                    time: duration,
+                    duration: duration
+                };
+
+                if (typeof current.profile !== 'undefined') params.profile = current.profile;
+
+                if (link && link.card) {
+                    params.card = link.card;
+
+                    if (typeof link.season !== 'undefined') params.season = link.season;
+                    if (typeof link.episode !== 'undefined') params.episode = link.episode;
+                }
+
+                timeline.update(params);
+            }
+
+            return 'marked';
+        }
+
+        /**
+         * Вышедшие серии сезона: номер ≥ 1, дата известна и уже наступила.
+         * Будущие и серии без даты только подсчитываются
+         */
+        function airedEpisodes(seasonData, now, result) {
+            var list = [];
+
+            for (var i = 0; i < seasonData.episodes.length; i++) {
+                var ep = seasonData.episodes[i] || {};
+                var number = toInt(ep.episode_number);
+                var date = parseAirDate(ep.air_date);
+
+                if (!(number >= 1)) continue;
+
+                if (isNaN(date)) {
+                    result.undated++;
+                } else if (date > now) {
+                    result.future++;
+                } else if (list.indexOf(number) === -1) {
+                    list.push(number);
+                }
+            }
+
+            return list.sort(function (a, b) {
+                return a - b;
+            });
+        }
+
+        /**
+         * Страницы со строкой «Продолжить просмотр» пересоздаются при возврате
+         * на них штатным activity.refresh() (2.3.0: needRefresh, 3.x: waite_refresh)
+         */
+        function refreshRows() {
+            try {
+                var activity = L().Activity;
+
+                if (!activity || typeof activity.all !== 'function') return;
+
+                var active = typeof activity.active === 'function' ? activity.active() : null;
+                var list = activity.all() || [];
+                var count = 0;
+
+                for (var i = 0; i < list.length; i++) {
+                    var item = list[i];
+
+                    if (!item || item === active || !item.activity || typeof item.activity.refresh !== 'function') continue;
+                    if (item.component !== 'main' && item.component !== 'category') continue;
+
+                    item.activity.refresh();
+                    count++;
+                }
+
+                log('rows refresh requested:', count);
+            } catch (e) {
+                log('rows refresh error', e && e.message);
+            }
+        }
+
+        /**
+         * Отметить все вышедшие серии сериала просмотренными.
+         * @param {object} card - карточка сериала (data.movie страницы сериала)
+         * @param {function} callback - получает {status:'ok'|'partial'|'error'|'busy', marked, already, future, undated, failed, ...}
+         */
+        function markAllAired(card, callback) {
+            callback = typeof callback === 'function' ? callback : function () {};
+
+            if (marking) return callback({ status: 'busy' });
+            if (!markable(card)) return callback({ status: 'error', error: 'not_series' });
+
+            var id = cardId(card);
+            var copy = {
+                id: id,
+                source: card.source,
+                name: card.name,
+                original_name: card.original_name,
+                original_title: card.original_title,
+                original_language: card.original_language,
+                number_of_seasons: card.number_of_seasons,
+                first_air_date: card.first_air_date
+            };
+            var result = { status: 'ok', id: id, marked: 0, already: 0, future: 0, undated: 0, errors: 0, total: 0, seasons: [], failed: [] };
+
+            marking = { id: id };
+
+            function finish(status, error) {
+                result.status = status;
+
+                if (error) result.error = error;
+
+                marking = null;
+
+                log('mark', id, copy.original_name || copy.name, '→', status, error || '', 'marked:', result.marked, 'already:', result.already, 'future:', result.future, 'undated:', result.undated, 'failed seasons:', result.failed.join(',') || '-');
+
+                callback(result);
+            }
+
+            tmdbGet('tv/' + id, function (details) {
+                try {
+                    if (!details || toInt(details.id) !== id) return finish('error', 'bad_details');
+
+                    var now = clock();
+                    var plan = planSeasons(details, now);
+
+                    if (plan.status !== 'ok') return finish(plan.reason === 'nothing_aired' ? 'ok' : 'error', plan.reason);
+
+                    var seasons = sortedNumbers(plan.seasons);
+                    var seasonsData = {};
+                    var pending = [];
+                    var index = 0;
+                    var limit = threshold();
+
+                    var complete = function () {
+                        // Состояние пересчитывается по свежим отметкам и тем же данным TMDB:
+                        // будущие серии дают nextAir, после которого сериал вернётся
+                        if (!result.failed.length && !result.errors) store(copy, evaluate(details, seasonsData, clock(), makeIsWatched(copy)));
+                        else store(copy, { status: 'unknown', reason: 'mark_partial' });
+
+                        refreshRows();
+
+                        if (!result.failed.length && !result.errors) return finish('ok');
+
+                        finish(result.marked || result.already ? 'partial' : 'error', result.failed.length ? 'season_failed' : 'write_failed');
+                    };
+
+                    var write = function () {
+                        var chunk = pending.splice(0, MARK_CHUNK);
+
+                        for (var i = 0; i < chunk.length; i++) {
+                            try {
+                                if (markEpisode(copy, chunk[i][0], chunk[i][1], limit) === 'already') result.already++;
+                                else result.marked++;
+                            } catch (e) {
+                                result.errors++;
+                                log('mark error', 's' + chunk[i][0] + 'e' + chunk[i][1], e && e.message);
+                            }
+                        }
+
+                        if (pending.length) timers.set(write, 0);
+                        else complete();
+                    };
+
+                    var loadNext = function () {
+                        if (index >= seasons.length) {
+                            result.total = pending.length;
+
+                            return pending.length ? write() : complete();
+                        }
+
+                        var number = seasons[index++];
+
+                        tmdbGet('tv/' + id + '/season/' + number, function (json) {
+                            if (!json || !isArray(json.episodes)) {
+                                result.failed.push(number);
+
+                                return loadNext();
+                            }
+
+                            seasonsData[number] = json;
+                            result.seasons.push(number);
+
+                            var aired = airedEpisodes(json, now, result);
+
+                            for (var i = 0; i < aired.length; i++) pending.push([number, aired[i]]);
+
+                            loadNext();
+                        }, function (err) {
+                            log('mark season error', number, err);
+                            result.failed.push(number);
+                            loadNext();
+                        });
+                    };
+
+                    loadNext();
+                } catch (e) {
+                    finish('error', 'exception: ' + (e && e.message));
+                }
+            }, function (err) {
+                finish('error', 'details_' + err);
+            });
+        }
+
+        function notify(text) {
+            try {
+                L().Noty.show(text);
+            } catch (e) {}
+        }
+
+        function markErrorText(error) {
+            var map = {
+                details_network: 'нет связи с TMDB',
+                details_timeout: 'TMDB не ответил',
+                bad_details: 'TMDB вернул некорректные данные',
+                no_seasons: 'нет данных о сезонах',
+                no_regular_seasons: 'нет обычных сезонов',
+                season_failed: 'не загрузились сезоны',
+                write_failed: 'не удалось записать историю',
+                not_series: 'это не сериал'
+            };
+
+            return map[error] || error || 'неизвестная ошибка';
+        }
+
+        function markMessage(r) {
+            if (r.status === 'busy') return 'Отметка серий уже выполняется, подождите';
+
+            if (r.status === 'error' && !r.marked) {
+                return 'Не удалось отметить серии: ' + markErrorText(r.error) + (r.failed && r.failed.length ? ' (сезоны ' + r.failed.join(', ') + ')' : '');
+            }
+
+            if (r.status === 'ok' && !r.marked && !r.already) return r.error === 'nothing_aired' ? 'У сериала ещё нет вышедших серий' : 'Вышедших серий с известной датой нет';
+
+            var parts = [];
+
+            if (r.marked) parts.push('Отмечено просмотренными: ' + r.marked + ' ' + plural(r.marked));
+            else parts.push('Все вышедшие серии уже были отмечены');
+
+            if (r.marked && r.already) parts.push('уже были отмечены: ' + r.already);
+            if (r.future) parts.push('будущие не отмечены: ' + r.future);
+            if (r.undated) parts.push('без даты выхода пропущено: ' + r.undated);
+
+            var text = parts.join(', ');
+
+            if (r.status === 'partial') {
+                text += '. Не загрузились сезоны: ' + (r.failed.length ? r.failed.join(', ') : '-') + (r.errors ? ', ошибок записи: ' + r.errors : '') + '. Повторите позже';
+            }
+
+            return text;
+        }
+
+        function plural(n) {
+            var mod10 = n % 10;
+            var mod100 = n % 100;
+
+            if (mod10 === 1 && mod100 !== 11) return 'серия';
+            if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return 'серии';
+
+            return 'серий';
+        }
+
+        function onMarkPress(movie, button) {
+            if (marking) return notify(markMessage({ status: 'busy' }));
+
+            button.addClass('hws-mark--busy');
+            notify('Отмечаю вышедшие серии…');
+
+            markAllAired(movie, function (r) {
+                button.removeClass('hws-mark--busy');
+                notify(markMessage(r));
+            });
+        }
+
+        /**
+         * Кнопка на странице сериала. Событие full/complite приходит до
+         * activity.toggle(), поэтому кнопка попадает в навигацию пульта
+         */
+        function onFull(e) {
+            if (!e || e.type !== 'complite') return;
+
+            try {
+                var movie = e.data && e.data.movie;
+
+                if (!markable(movie)) return;
+
+                var render = null;
+
+                if (e.object && e.object.activity && typeof e.object.activity.render === 'function') render = e.object.activity.render();
+                if ((!render || typeof render.find !== 'function') && e.body) render = e.body;
+                if (!render || typeof render.find !== 'function') return;
+
+                var container = render.find('.full-start-new__buttons');
+
+                if (!container.length) container = render.find('.full-start__buttons');
+                if (!container.length) return log('mark button: no buttons container');
+                if (container.find('.button--hws-mark').length) return;
+
+                var jq = win.$ || win.jQuery;
+                var button = jq('<div class="full-start__button selector button--hws-mark">' +
+                    '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M2 12.5l4 4 8-9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 15.5l1 1 9-10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+                    '<span>' + MARK_LABEL + '</span></div>');
+
+                button.on('hover:enter', function () {
+                    onMarkPress(movie, button);
+                });
+
+                var options = container.find('.button--options');
+
+                if (options.length) options.before(button);
+                else container.append(button);
+
+                log('mark button added', movie.id);
+            } catch (err) {
+                log('mark button error', err && err.message);
+            }
+        }
+
         /* ---------- источник списка для фоновой проверки ---------- */
 
         function continueList() {
@@ -1213,6 +1602,10 @@
                 } catch (e) {}
 
                 try {
+                    if (lampa.Listener && typeof lampa.Listener.follow === 'function') lampa.Listener.follow('full', onFull);
+                } catch (e) {}
+
+                try {
                     if (lampa.Manifest) {
                         lampa.Manifest.plugins = {
                             type: 'other',
@@ -1276,6 +1669,8 @@
             },
             filterList: filterList,
             hideCard: hideCard,
+            markAllAired: markAllAired,
+            markMessage: markMessage,
             cache: function () {
                 return loadCache();
             },

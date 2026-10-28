@@ -1,10 +1,11 @@
 /*!
  * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
- * Версия 1.2.0
+ * Версия 1.3.0
  *
  * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
  * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
- * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными».
+ * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными»
+ * и «Продолжить» — открывает последнюю раздачу с курсором на следующей серии.
  * На странице фильма — кнопку «Отметить просмотренным» и зелёную плашку на постере.
  *
  * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
@@ -15,7 +16,7 @@
 (function (root) {
     'use strict';
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.3.0';
     var LOG_TAG = 'HideWatched';
 
     var CACHE_KEY = 'hws_cache';
@@ -1309,6 +1310,8 @@
 
                 if (!series) return addMovieButton(movie, render, container);
 
+                addContinueButton(movie, container);
+
                 if (container.find('.button--hws-mark').length) return;
 
                 var jq = win.$ || win.jQuery;
@@ -1707,6 +1710,310 @@
             log('movie button added', movieKey(movie), on ? 'watched' : '');
         }
 
+        /* ---------- «Продолжить» с последнего торрента сериала ---------- */
+
+        // Lampa не связывает раздачу с сериалом (torrents_view — только хеши), поэтому
+        // плагин запоминает раздачу сам, когда с неё запускают серию
+        var TORRENTS_KEY = 'hws_torrents';
+        var TORRENTS_VERSION = 1;
+        var TORRENTS_LIMIT = 200;
+        // Запуск торрента считается тем же просмотром, если серия включена в течение этого времени
+        var START_WINDOW = 6 * HOUR;
+        // Сколько ждать список файлов после нажатия «Продолжить», чтобы поставить курсор
+        var FOCUS_WINDOW = 2 * 60 * 1000;
+        var torrentRecords = null;
+        var lastStart = null;
+        var pendingFocus = null;
+        var listItems = [];
+        var focusTimer = null;
+
+        function seriesKey(card) {
+            return markable(card) ? movieKey(card) : null;
+        }
+
+        function loadTorrents() {
+            if (torrentRecords) return torrentRecords;
+
+            torrentRecords = {};
+
+            try {
+                var ls = storage();
+                var raw = ls ? ls.getItem(TORRENTS_KEY) : null;
+                var parsed = raw ? JSON.parse(raw) : null;
+
+                if (parsed && parsed.v === TORRENTS_VERSION && parsed.items && typeof parsed.items === 'object' && !isArray(parsed.items)) {
+                    for (var key in parsed.items) {
+                        var rec = parsed.items[key];
+
+                        if (Object.prototype.hasOwnProperty.call(parsed.items, key) && rec && typeof rec === 'object' && (rec.link || rec.hash)) torrentRecords[key] = rec;
+                    }
+                }
+            } catch (e) {
+                log('torrents: broken data ignored', e && e.message);
+                torrentRecords = {};
+            }
+
+            return torrentRecords;
+        }
+
+        function saveTorrents() {
+            try {
+                var items = loadTorrents();
+                var keys = Object.keys(items);
+
+                if (keys.length > TORRENTS_LIMIT) {
+                    keys.sort(function (a, b) {
+                        return (items[a].t || 0) - (items[b].t || 0);
+                    });
+
+                    for (var i = 0; i < keys.length - TORRENTS_LIMIT; i++) delete items[keys[i]];
+                }
+
+                var ls = storage();
+
+                if (ls) ls.setItem(TORRENTS_KEY, JSON.stringify({ v: TORRENTS_VERSION, items: items }));
+            } catch (e) {
+                log('torrents save error', e && e.message);
+            }
+        }
+
+        function torrentRecord(card) {
+            var key = seriesKey(card);
+
+            return key ? loadTorrents()[key] || null : null;
+        }
+
+        function textValue(value) {
+            return typeof value === 'string' && value.length ? value : '';
+        }
+
+        /**
+         * Обёртка Lampa.Torrent.start(element, movie): запоминает выбранную раздачу.
+         * Сохраняется она только при запуске серии (onenter), а не при простом открытии
+         */
+        function patchTorrentStart() {
+            var torrent = L().Torrent;
+
+            if (!torrent || typeof torrent.start !== 'function' || torrent.start.__hws) return;
+
+            var original = torrent.start;
+            var wrapped = function (element, movie) {
+                try {
+                    if (element && movie && seriesKey(movie)) {
+                        lastStart = {
+                            key: seriesKey(movie),
+                            title: textValue(element.title) || textValue(element.Title),
+                            magnet: textValue(element.MagnetUri),
+                            link: textValue(element.Link),
+                            t: clock()
+                        };
+                    }
+                } catch (e) {}
+
+                return original.apply(this, arguments);
+            };
+
+            wrapped.__hws = original;
+            torrent.start = wrapped;
+        }
+
+        function onTorrentFile(e) {
+            if (!e) return;
+
+            try {
+                if (e.type === 'list_open') {
+                    listItems = [];
+                } else if (e.type === 'render') {
+                    if (pendingFocus && e.element && e.item) {
+                        listItems.push({ element: e.element, item: e.item });
+
+                        if (!focusTimer) focusTimer = timers.set(applyPendingFocus, 50);
+                    }
+                } else if (e.type === 'onenter') {
+                    rememberTorrent(e.element);
+                } else if (e.type === 'list_close') {
+                    pendingFocus = null;
+                    listItems = [];
+                }
+            } catch (err) {
+                log('torrent event error', err && err.message);
+            }
+        }
+
+        function rememberTorrent(element) {
+            if (!element) return;
+
+            var card = element.card;
+            var key = seriesKey(card);
+            var season = toInt(element.season);
+            var episode = toInt(element.episode);
+
+            if (!key || !(episode >= 1)) return;
+
+            var items = loadTorrents();
+            var prev = items[key] || {};
+            var hashValue = textValue(element.torrent_hash);
+            var record = {
+                hash: hashValue || prev.hash || '',
+                season: season >= 0 ? season : 1,
+                episode: episode,
+                t: clock()
+            };
+
+            // Ссылку на раздачу знает только Torrent.start; при открытии из «Моих торрентов» её нет
+            if (lastStart && lastStart.key === key && clock() - lastStart.t <= START_WINDOW && (lastStart.magnet || lastStart.link)) {
+                record.title = lastStart.title;
+                record.magnet = lastStart.magnet;
+                record.link = lastStart.link;
+            } else if (prev.hash && prev.hash === record.hash) {
+                record.title = prev.title;
+                record.magnet = prev.magnet;
+                record.link = prev.link;
+            }
+
+            items[key] = record;
+            saveTorrents();
+
+            log('torrent remembered', key, 's' + record.season + 'e' + record.episode, record.magnet ? 'magnet' : record.link ? 'link' : 'hash only');
+        }
+
+        /**
+         * Курсор на следующую серию: первая не досмотренная после последней досмотренной
+         * (по прогрессу, который Lampa показывает в этом же списке)
+         */
+        function pickNextItem(entries, limit) {
+            var list = [];
+
+            for (var i = 0; i < entries.length; i++) {
+                var el = entries[i].element || {};
+                var episode = toInt(el.episode);
+
+                if (!(episode >= 1)) continue;
+
+                var percent = parseFloat(el.timeline && el.timeline.percent);
+
+                list.push({
+                    entry: entries[i],
+                    season: toInt(el.season) >= 0 ? toInt(el.season) : 1,
+                    episode: episode,
+                    watched: !isNaN(percent) && percent >= limit,
+                    order: i
+                });
+            }
+
+            if (!list.length) return null;
+
+            list.sort(function (a, b) {
+                return a.season - b.season || a.episode - b.episode || a.order - b.order;
+            });
+
+            var lastWatched = -1;
+
+            for (var j = 0; j < list.length; j++) {
+                if (list[j].watched) lastWatched = j;
+            }
+
+            for (var k = lastWatched + 1; k < list.length; k++) {
+                if (!list[k].watched) return list[k].entry;
+            }
+
+            // Всё досмотрено — курсор на последнюю серию раздачи
+            return list[list.length - 1].entry;
+        }
+
+        function applyPendingFocus() {
+            focusTimer = null;
+
+            if (!pendingFocus || !listItems.length) return;
+
+            if (clock() - pendingFocus.t > FOCUS_WINDOW) {
+                pendingFocus = null;
+
+                return;
+            }
+
+            try {
+                var next = pickNextItem(listItems, threshold());
+                var lampa = L();
+
+                if (!next || !lampa.Controller || typeof lampa.Controller.collectionFocus !== 'function') return;
+
+                var scroll = lampa.Modal && typeof lampa.Modal.scroll === 'function' ? lampa.Modal.scroll() : null;
+
+                lampa.Controller.collectionFocus(next.item, scroll && scroll.render ? scroll.render() : undefined);
+
+                log('torrent focus', 's' + next.element.season + 'e' + next.element.episode);
+            } catch (e) {
+                log('torrent focus error', e && e.message);
+            }
+
+            pendingFocus = null;
+        }
+
+        function pad2(n) {
+            return (n < 10 ? '0' : '') + n;
+        }
+
+        function continueLabel(record) {
+            return 'Продолжить: последняя серия ' + record.season + '×' + pad2(record.episode);
+        }
+
+        /**
+         * Открыть ту же раздачу: по magnet/ссылке через Torrent.start (раздача заново
+         * добавится в TorrServer), иначе по хешу через Torrent.open
+         */
+        function continueTorrent(card) {
+            var record = torrentRecord(card);
+            var torrent = L().Torrent;
+
+            if (!record || !torrent) return false;
+
+            pendingFocus = { key: seriesKey(card), t: clock() };
+            listItems = [];
+
+            if (record.magnet || record.link) {
+                var element = { title: record.title || card.name || card.title || '', Title: record.title || '', poster: card.img || '' };
+
+                if (record.magnet) element.MagnetUri = record.magnet;
+                if (record.link) element.Link = record.link;
+
+                torrent.start(element, card);
+            } else if (record.hash && typeof torrent.open === 'function') {
+                torrent.open(record.hash, card);
+            } else {
+                pendingFocus = null;
+
+                return false;
+            }
+
+            log('torrent continue', seriesKey(card), record.magnet ? 'magnet' : record.link ? 'link' : 'hash');
+
+            return true;
+        }
+
+        function addContinueButton(movie, container) {
+            var record = torrentRecord(movie);
+
+            if (!record || container.find('.button--hws-continue').length) return;
+
+            var jq = win.$ || win.jQuery;
+            var button = jq('<div class="full-start__button selector button--hws-continue">' +
+                '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 4.5v15l11-7.5z" fill="currentColor"/><path d="M19.5 4.5v15" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>' +
+                '<span>' + continueLabel(record) + '</span></div>');
+
+            button.on('hover:enter', function () {
+                if (!continueTorrent(movie)) notify('Нет сохранённой раздачи для этого сериала');
+            });
+
+            // Сразу после «Смотреть»: до кнопки одно нажатие вправо
+            var play = container.find('.button--play');
+
+            if (play.length) play.after(button);
+            else container.append(button);
+
+            log('continue button added', seriesKey(movie), 's' + record.season + 'e' + record.episode);
+        }
+
         /* ---------- источник списка для фоновой проверки ---------- */
 
         function continueList() {
@@ -1989,6 +2296,12 @@
                 startBadges();
 
                 try {
+                    patchTorrentStart();
+
+                    if (lampa.Listener && typeof lampa.Listener.follow === 'function') lampa.Listener.follow('torrent_file', onTorrentFile);
+                } catch (e) {}
+
+                try {
                     if (lampa.Manifest) {
                         lampa.Manifest.plugins = {
                             type: 'other',
@@ -2059,6 +2372,8 @@
             toggleMovieWatched: toggleMovieWatched,
             movieKey: movieKey,
             scanBadges: scanBadges,
+            torrentRecord: torrentRecord,
+            continueTorrent: continueTorrent,
             cache: function () {
                 return loadCache();
             },

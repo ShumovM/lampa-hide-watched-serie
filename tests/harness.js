@@ -72,6 +72,14 @@ function wrap(nodes) {
 
             return w;
         },
+        after(other) {
+            const target = nodes[0];
+            const siblings = target.parent.children;
+
+            other.nodes.slice().reverse().forEach((c) => { c.parent = target.parent; siblings.splice(siblings.indexOf(target) + 1, 0, c); });
+
+            return w;
+        },
         on(event, fn) {
             nodes.forEach((n) => (n.handlers[event] = n.handlers[event] || []).push(fn));
 
@@ -402,6 +410,20 @@ function createEnv(opts) {
             addParam(p) { this.params.push(p); }
         },
         Noty: { show(text) { env.noty.push(text); } },
+        // Torrent из interaction/torrent.js 3.x: start(element, movie) / open(hash, movie)
+        Torrent: {
+            calls: [],
+            start(element, movie) { this.calls.push({ fn: 'start', element: JSON.parse(JSON.stringify(element)), movie }); },
+            open(hash, movie) { this.calls.push({ fn: 'open', hash, movie }); },
+            opened() {}
+        },
+        Controller: {
+            focus: [],
+            collectionFocus(target, scroll) { this.focus.push({ target, scroll }); }
+        },
+        Modal: {
+            scroll() { return { render() { return 'modal-scroll'; } }; }
+        },
         // Activity.all(): элементы {component, activity}; refresh() как в 2.3.0/3.x
         Activity: {
             stack: [],

@@ -1247,6 +1247,291 @@ checkAsync('F14', 'Значки закладок вверху: плашка оп
     return [plain, withIcon, low(), el.querySelectorAll('.hws-watched-badge').length];
 });
 
+/* ---------------- «Продолжить» с последнего торрента ---------------- */
+
+const SERIES = { id: 247718, source: 'tmdb', name: 'MobLand', original_name: 'MobLand', original_title: 'MobLand', first_air_date: '2025-03-30', number_of_seasons: 2, img: 'poster.jpg' };
+const series = (extra) => Object.assign({}, SERIES, extra || {});
+const TORRENT = { title: 'MobLand S01-02 WEB-DL 1080p', Title: 'MobLand S01-02 WEB-DL 1080p', MagnetUri: 'magnet:?xt=urn:btih:ABC123', Link: 'http://jackett/dl/1' };
+
+// Список файлов как в interaction/torrent.js list(): list_open → render ×N; serverHash — хеш TorrServer
+function torrentList(env, files, serverHash) {
+    env.Lampa.Listener.send('torrent_file', { type: 'list_open', items: files });
+
+    return files.map((f) => {
+        const element = { season: f[0], episode: f[1], timeline: { percent: f[2] || 0 }, torrent_hash: serverHash || 'srvhash', card: f[3] || series() };
+        const item = { name: 's' + f[0] + 'e' + f[1] };
+
+        env.Lampa.Listener.send('torrent_file', { type: 'render', element, item, items: files });
+
+        return { element, item };
+    });
+}
+
+// Пользователь выбрал раздачу (components/torrents.js → Torrent.start) и запустил серию
+function playFromTorrent(env, card, s, e, torrent) {
+    env.Lampa.Torrent.start(torrent || TORRENT, card);
+
+    const rendered = torrentList(env, [[s, e, 0, card]]);
+
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: rendered[0].element, item: rendered[0].item });
+}
+
+check('T1', 'Запуск серии из раздачи запоминает раздачу, сезон, серию и хеш', { title: TORRENT.title, magnet: TORRENT.MagnetUri, link: TORRENT.Link, hash: 'srvhash', season: 2, episode: 6 }, () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+
+    const r = env.win.HideWatchedSeries.torrentRecord(series());
+
+    return { title: r.title, magnet: r.magnet, link: r.link, hash: r.hash, season: r.season, episode: r.episode };
+});
+
+check('T1a', 'Только открыли список файлов без запуска серии — ничего не запоминается', null, () => {
+    const env = fresh();
+
+    env.Lampa.Torrent.start(TORRENT, series());
+    torrentList(env, [[2, 6, 0]]);
+
+    return env.win.HideWatchedSeries.torrentRecord(series());
+});
+
+check('T2', 'Кнопка «Продолжить» на странице сериала сразу после «Смотреть», с последней серией', [1, 1, 'Продолжить: последняя серия 2×06'], () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+
+    const page = env.openFull(series());
+    const btn = page.root.find('.button--hws-continue');
+
+    return [btn.length, btn.index(), /<span>([^<]+)<\/span>/.exec(btn.nodes[0].html)[1]];
+});
+
+check('T2a', 'Без сохранённой раздачи кнопки нет; у фильма кнопки нет', [0, 0], () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+
+    const other = env.openFull(series({ id: 1396, name: 'Breaking Bad', original_name: 'Breaking Bad', original_title: 'Breaking Bad' }));
+    const film = env.openFull({ id: 247718, source: 'tmdb', title: 'MobLand', original_title: 'MobLand', release_date: '2020-01-01' });
+
+    return [other.root.find('.button--hws-continue').length, film.root.find('.button--hws-continue').length];
+});
+
+check('T3', 'Нажатие открывает ту же раздачу через Torrent.start с magnet и сериалом', ['start', 'magnet:?xt=urn:btih:ABC123', 'http://jackett/dl/1', 'MobLand S01-02 WEB-DL 1080p', 247718], () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Torrent.calls.length = 0;
+
+    env.openFull(series()).root.find('.button--hws-continue').trigger('hover:enter');
+
+    const c = env.Lampa.Torrent.calls[0];
+
+    return [c.fn, c.element.MagnetUri, c.element.Link, c.element.title, c.movie.id];
+});
+
+check('T4', 'Курсор на следующую серию: после последней досмотренной — первая недосмотренная', ['s2e7', 'modal-scroll'], () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+
+    // файлы в произвольном порядке, два сезона
+    torrentList(env, [[2, 8, 0], [1, 10, 100], [2, 7, 0], [2, 5, 100], [2, 6, 95], [1, 9, 100]]);
+    env.flush();
+
+    const f = env.Lampa.Controller.focus[0];
+
+    return [f.target.name, f.scroll];
+});
+
+check('T4a', 'Последняя серия досмотрена частично — курсор на неё (продолжить с места)', 's2e6', () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+    torrentList(env, [[2, 5, 100], [2, 6, 50], [2, 7, 0]]);
+    env.flush();
+
+    return env.Lampa.Controller.focus[0].target.name;
+});
+
+check('T4b', 'Пропущенная в середине серия не сбивает: курсор после последней досмотренной', 's1e5', () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 1, 4);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+    torrentList(env, [[1, 1, 100], [1, 2, 0], [1, 3, 100], [1, 4, 100], [1, 5, 0]]);
+    env.flush();
+
+    return env.Lampa.Controller.focus[0].target.name;
+});
+
+check('T4c', 'Всё в раздаче досмотрено — курсор на последнюю серию', 's1e3', () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 1, 3);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+    torrentList(env, [[1, 1, 100], [1, 2, 100], [1, 3, 100]]);
+    env.flush();
+
+    return env.Lampa.Controller.focus[0].target.name;
+});
+
+check('T5', 'Обычный путь «Смотреть» → раздача: курсор плагин не трогает', 0, () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Controller.focus.length = 0;
+    env.Lampa.Torrent.start(TORRENT, series());
+    torrentList(env, [[2, 6, 100], [2, 7, 0]]);
+    env.flush();
+
+    return env.Lampa.Controller.focus.length;
+});
+
+check('T5a', 'Курсор ставится один раз: после закрытия списка и повторного открытия — нет', [1, 1], () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+    torrentList(env, [[2, 6, 100], [2, 7, 0]]);
+    env.flush();
+
+    const first = env.Lampa.Controller.focus.length;
+
+    env.Lampa.Listener.send('torrent_file', { type: 'list_close' });
+    torrentList(env, [[2, 6, 100], [2, 7, 0]]);
+    env.flush();
+
+    return [first, env.Lampa.Controller.focus.length];
+});
+
+check('T5b', 'Список файлов пришёл позже 2 минут после нажатия — курсор не ставится', 0, () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.Lampa.Controller.focus.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+    env.advance(3 / 24 / 60);
+    torrentList(env, [[2, 6, 100], [2, 7, 0]]);
+    env.flush();
+
+    return env.Lampa.Controller.focus.length;
+});
+
+check('T6', 'Раздача открыта из «Моих торрентов» (без Torrent.start): запоминается хеш, повтор через Torrent.open', ['open', 'myhash', 247718], () => {
+    const env = fresh();
+    const rendered = torrentList(env, [[2, 6, 0]], 'myhash');
+
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: rendered[0].element, item: rendered[0].item });
+    env.Lampa.Torrent.calls.length = 0;
+    env.win.HideWatchedSeries.continueTorrent(series());
+
+    const c = env.Lampa.Torrent.calls[0];
+
+    return [c.fn, c.hash, c.movie.id];
+});
+
+check('T6a', 'Тот же хеш без Torrent.start: magnet из прошлой записи сохраняется', 'magnet:?xt=urn:btih:ABC123', () => {
+    const env = fresh();
+
+    playFromTorrent(env, series(), 2, 6);
+    env.advance(1);
+
+    const rendered = torrentList(env, [[2, 7, 0]], 'srvhash');
+
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: rendered[0].element, item: rendered[0].item });
+
+    return env.win.HideWatchedSeries.torrentRecord(series()).magnet;
+});
+
+check('T7', 'Раздача другого сериала или устаревший запуск (> 6 ч) не приписываются', ['', ''], () => {
+    const env = fresh();
+    const other = series({ id: 1396, name: 'Breaking Bad', original_name: 'Breaking Bad', original_title: 'Breaking Bad' });
+
+    // выбрали раздачу у другого сериала, а запустили серию MobLand
+    env.Lampa.Torrent.start(TORRENT, other);
+
+    let r = torrentList(env, [[2, 6, 0]], 'h1');
+
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: r[0].element });
+
+    const a = env.win.HideWatchedSeries.torrentRecord(series()).magnet || '';
+
+    // запуск давно
+    const env2 = fresh();
+
+    env2.Lampa.Torrent.start(TORRENT, series());
+    env2.advance(0.3);
+    r = torrentList(env2, [[2, 6, 0]], 'h2');
+    env2.Lampa.Listener.send('torrent_file', { type: 'onenter', element: r[0].element });
+
+    return [a, env2.win.HideWatchedSeries.torrentRecord(series()).magnet || ''];
+});
+
+check('T8', 'Фильм из торрента не запоминается; серия без номера — тоже', [null, null], () => {
+    const env = fresh();
+    const film = { id: 27205, source: 'tmdb', title: 'Inception', original_title: 'Inception', release_date: '2010-07-15' };
+
+    env.Lampa.Torrent.start(TORRENT, film);
+
+    let r = torrentList(env, [[0, 0, 0, film]]);
+
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: r[0].element });
+
+    r = torrentList(env, [[1, 0, 0]]);
+    env.Lampa.Listener.send('torrent_file', { type: 'onenter', element: r[0].element });
+
+    return [env.win.HideWatchedSeries.torrentRecord(film), env.win.HideWatchedSeries.torrentRecord(series())];
+});
+
+check('T9', 'Сохраняется после перезапуска; повреждённые данные игнорируются', [true, null], () => {
+    const first = fresh();
+
+    playFromTorrent(first, series(), 2, 6);
+
+    const again = createEnv({ localStorage: first.ls });
+
+    again.install();
+    again.flush();
+
+    const broken = createEnv({ localStorage: memoryStorage({ hws_torrents: '{oops' }) });
+
+    broken.install();
+    broken.flush();
+
+    return [again.win.HideWatchedSeries.torrentRecord(series()).magnet === TORRENT.MagnetUri, broken.win.HideWatchedSeries.torrentRecord(series())];
+});
+
+check('T10', 'Повторная загрузка: Torrent.start обёрнут один раз, обработчик torrent_file один', [true, 1], () => {
+    const env = createEnv();
+
+    env.install();
+    delete require.cache[require.resolve('../hide_watched_series.js')];
+    require('../hide_watched_series.js').install(env.win);
+    env.flush();
+
+    const fn = env.Lampa.Torrent.start;
+
+    return [typeof fn.__hws === 'function' && !fn.__hws.__hws, env.Lampa.Listener.count('torrent_file')];
+});
+
+check('T11', 'Запуск через обёртку передаёт аргументы в Lampa без изменений', [1, 'start', 247718], () => {
+    const env = fresh();
+
+    env.Lampa.Torrent.start(TORRENT, series());
+
+    const c = env.Lampa.Torrent.calls;
+
+    return [c.length, c[0].fn, c[0].movie.id];
+});
+
 /* ---------------- Отчёт ---------------- */
 async function runAsyncChecks() {
     for (const c of asyncChecks) {

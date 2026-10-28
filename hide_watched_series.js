@@ -1,0 +1,1316 @@
+/*!
+ * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
+ * Версия 1.0.0
+ *
+ * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
+ * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
+ *
+ * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
+ * ветка 3.x, где строка строится через Lampa.ContentRows.
+ * Код написан на ES5 (без стрелочных функций, let/const, Promise,
+ * Array.prototype.find/includes) для старых движков webOS.
+ */
+(function (root) {
+    'use strict';
+
+    var VERSION = '1.0.0';
+    var LOG_TAG = 'HideWatched';
+
+    var CACHE_KEY = 'hws_cache';
+    var CACHE_VERSION = 1;
+    var CACHE_LIMIT = 300;
+
+    var HOUR = 60 * 60 * 1000;
+    var DAY = 24 * HOUR;
+
+    // Сколько доверять результату «всё досмотрено» без перепроверки в TMDB
+    var SOFT_TTL = 6 * HOUR;
+    // Дальше этого срока результат вообще не используется для скрытия
+    var HARD_TTL = 7 * DAY;
+    // Повторная проверка сериала, у которого есть непросмотренные серии
+    var INCOMPLETE_TTL = 6 * HOUR;
+    // Повторная попытка после ошибки или недостатка данных
+    var RETRY_TTL = 15 * 60 * 1000;
+    var REQUEST_TIMEOUT = 20000;
+
+    var SETTINGS = {
+        enabled: 'hws_enabled',
+        anime: 'hws_anime',
+        threshold: 'hws_threshold',
+        debug: 'hws_debug'
+    };
+
+    var DEFAULT_THRESHOLD = 90;
+
+    // Та же проверка, что Utils.containsJapanese в Lampa 3.x
+    var JAPANESE_RE = /[぀-ヿㇰ-ㇿｦ-ﾟ一-鿿]/;
+
+    /* ======================================================================
+     * Core — чистая логика без обращения к Lampa (тестируется отдельно)
+     * ==================================================================== */
+
+    function isArray(value) {
+        return Object.prototype.toString.call(value) === '[object Array]';
+    }
+
+    function toInt(value) {
+        var n = parseInt(value, 10);
+
+        return isNaN(n) ? NaN : n;
+    }
+
+    /**
+     * Копия Lampa.Utils.hash (src/utils/math.js в 2.3.0, src/utils/utils.js в 3.x)
+     */
+    function hashString(input) {
+        var str = (input || '') + '';
+        var hash = 0;
+
+        if (str.length === 0) return hash + '';
+
+        for (var i = 0; i < str.length; i++) {
+            hash = ((hash << 5) - hash) + str.charCodeAt(i);
+            hash = hash & hash;
+        }
+
+        return Math.abs(hash) + '';
+    }
+
+    /**
+     * Строка, из которой Lampa строит хеш серии:
+     * [season, season > 10 ? ':' : '', episode, original_title].join('')
+     */
+    function episodeKey(season, episode, title) {
+        return [season, season > 10 ? ':' : '', episode, title].join('');
+    }
+
+    /**
+     * Дата выхода в формате TMDB (YYYY-MM-DD) → полночь по местному времени,
+     * как Lampa.Utils.parseToDate. Некорректная дата → NaN.
+     */
+    function parseAirDate(str) {
+        if (typeof str !== 'string') return NaN;
+
+        var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str);
+
+        if (!m) return NaN;
+
+        var time = new Date(toInt(m[1]), toInt(m[2]) - 1, toInt(m[3])).getTime();
+
+        return isNaN(time) ? NaN : time;
+    }
+
+    function isTvCard(card) {
+        return Boolean(card && (card.number_of_seasons || card.first_air_date));
+    }
+
+    function isAnimeCard(card) {
+        if (!card) return false;
+
+        return card.original_language === 'ja' || JAPANESE_RE.test(card.original_name || card.name || '');
+    }
+
+    /**
+     * Названия, под которыми Lampa и плагины онлайн-просмотра сохраняют
+     * прогресс серий: original_title (для сериалов карточка Lampa копирует туда
+     * original_name) и original_name.
+     */
+    function titleCandidates(card) {
+        var list = [];
+        var fields = ['original_title', 'original_name'];
+
+        for (var i = 0; i < fields.length; i++) {
+            var value = card ? card[fields[i]] : '';
+
+            if (typeof value === 'string' && value.length && list.indexOf(value) === -1) list.push(value);
+        }
+
+        return list;
+    }
+
+    function validEpisodeRef(ep) {
+        return Boolean(ep && toInt(ep.season_number) >= 0 && toInt(ep.episode_number) >= 1);
+    }
+
+    function reqHas(req, season, episode) {
+        var list = req[season];
+
+        return Boolean(list && list.indexOf(episode) !== -1);
+    }
+
+    function sortedNumbers(list) {
+        return list.slice().sort(function (a, b) {
+            return a - b;
+        });
+    }
+
+    /**
+     * Какие сезоны нужно загрузить для проверки.
+     * @returns {{status:string, reason?:string, seasons?:number[], last?:{season:number,episode:number}, nextAir:number}}
+     */
+    function planSeasons(details, now) {
+        var result = {
+            status: 'ok',
+            seasons: [],
+            last: null,
+            nextAir: 0
+        };
+
+        function noteFuture(time) {
+            if (time > now && (!result.nextAir || time < result.nextAir)) result.nextAir = time;
+        }
+
+        if (!details || !isArray(details.seasons) || !details.seasons.length) {
+            return { status: 'unknown', reason: 'no_seasons', nextAir: 0 };
+        }
+
+        var regular = [];
+        var maxAired = 0;
+
+        for (var i = 0; i < details.seasons.length; i++) {
+            var season = details.seasons[i] || {};
+            var number = toInt(season.season_number);
+
+            // Нулевой сезон — спецвыпуски: не учитываются ни для скрытия, ни для показа
+            if (!(number >= 1)) continue;
+
+            if (regular.indexOf(number) === -1) regular.push(number);
+
+            var date = parseAirDate(season.air_date);
+
+            if (!isNaN(date)) {
+                if (date <= now) maxAired = Math.max(maxAired, number);
+                else noteFuture(date);
+            }
+        }
+
+        if (!regular.length) return { status: 'unknown', reason: 'no_regular_seasons', nextAir: result.nextAir };
+
+        var last = details.last_episode_to_air;
+
+        if (validEpisodeRef(last) && toInt(last.season_number) >= 1) {
+            result.last = { season: toInt(last.season_number), episode: toInt(last.episode_number) };
+            maxAired = Math.max(maxAired, result.last.season);
+        }
+
+        var next = details.next_episode_to_air;
+
+        if (next) noteFuture(parseAirDate(next.air_date));
+
+        if (!maxAired) return { status: 'unknown', reason: 'nothing_aired', nextAir: result.nextAir };
+
+        regular = sortedNumbers(regular);
+
+        for (var j = 0; j < regular.length; j++) {
+            if (regular[j] <= maxAired) result.seasons.push(regular[j]);
+        }
+
+        // Сначала последние сезоны: непросмотренная серия там вероятнее, проверка короче
+        result.seasons.reverse();
+
+        return result;
+    }
+
+    /**
+     * Есть ли в загруженном сезоне вышедшая непросмотренная серия
+     */
+    function seasonHasUnwatched(seasonData, seasonNumber, now, isWatched) {
+        if (!seasonData || !isArray(seasonData.episodes)) return null;
+
+        for (var i = 0; i < seasonData.episodes.length; i++) {
+            var ep = seasonData.episodes[i] || {};
+            var number = toInt(ep.episode_number);
+            var date = parseAirDate(ep.air_date);
+
+            if (number >= 1 && !isNaN(date) && date <= now && !isWatched(seasonNumber, number)) {
+                return { season: seasonNumber, episode: number };
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Полная проверка сериала.
+     * @param {object} details - ответ TMDB tv/{id}
+     * @param {object} seasonsData - {номер_сезона: ответ TMDB tv/{id}/season/{n}}
+     * @param {number} now - текущее время, мс
+     * @param {function(number,number):boolean} isWatched - досмотрена ли серия
+     * @returns {{status:'complete'|'incomplete'|'unknown', reason:string, req?:object, count?:number, nextAir:number}}
+     */
+    function evaluate(details, seasonsData, now, isWatched) {
+        var plan = planSeasons(details, now);
+
+        if (plan.status !== 'ok') return { status: 'unknown', reason: plan.reason, nextAir: plan.nextAir };
+
+        var nextAir = plan.nextAir;
+        var req = {};
+        var count = 0;
+        var undatedPending = false;
+        var unwatched = null;
+        var seasons = sortedNumbers(plan.seasons);
+
+        function noteFuture(time) {
+            if (time > now && (!nextAir || time < nextAir)) nextAir = time;
+        }
+
+        function unknown(reason) {
+            return { status: 'unknown', reason: reason, nextAir: nextAir };
+        }
+
+        for (var i = 0; i < seasons.length; i++) {
+            var seasonNumber = seasons[i];
+            var data = seasonsData ? seasonsData[seasonNumber] : null;
+
+            if (!data || !isArray(data.episodes) || !data.episodes.length) return unknown('season_missing_' + seasonNumber);
+
+            var episodes = data.episodes.slice().sort(function (a, b) {
+                return toInt(a && a.episode_number) - toInt(b && b.episode_number);
+            });
+
+            for (var j = 0; j < episodes.length; j++) {
+                var ep = episodes[j] || {};
+                var number = toInt(ep.episode_number);
+
+                if (!(number >= 1)) return unknown('bad_episode_number_s' + seasonNumber);
+
+                var date = parseAirDate(ep.air_date);
+
+                // Серия без даты: считаем ещё не вышедшей, но только если после неё
+                // нет вышедших серий — иначе данные противоречивы
+                if (isNaN(date)) {
+                    undatedPending = true;
+                    continue;
+                }
+
+                if (date > now) {
+                    noteFuture(date);
+                    continue;
+                }
+
+                if (undatedPending) return unknown('undated_before_aired_s' + seasonNumber + 'e' + number);
+
+                if (!req[seasonNumber]) req[seasonNumber] = [];
+
+                if (req[seasonNumber].indexOf(number) === -1) {
+                    req[seasonNumber].push(number);
+                    count++;
+                }
+
+                if (!unwatched && !isWatched(seasonNumber, number)) unwatched = { season: seasonNumber, episode: number };
+            }
+        }
+
+        if (!count) return unknown('no_aired_episodes');
+
+        // Сверка с полем TMDB «последняя вышедшая серия»
+        if (!plan.last) return unknown('no_last_episode');
+
+        if (!reqHas(req, plan.last.season, plan.last.episode)) return unknown('last_episode_mismatch');
+
+        var next = details.next_episode_to_air;
+
+        if (validEpisodeRef(next) && toInt(next.season_number) >= 1) {
+            var nextDate = parseAirDate(next.air_date);
+
+            if (!isNaN(nextDate) && nextDate <= now && !reqHas(req, toInt(next.season_number), toInt(next.episode_number))) {
+                return unknown('next_episode_mismatch');
+            }
+        }
+
+        if (unwatched) {
+            return {
+                status: 'incomplete',
+                reason: 'unwatched_s' + unwatched.season + 'e' + unwatched.episode,
+                nextAir: nextAir
+            };
+        }
+
+        return {
+            status: 'complete',
+            reason: 'all_watched',
+            req: req,
+            count: count,
+            nextAir: nextAir
+        };
+    }
+
+    /**
+     * Синхронное решение для отрисовки строки по сохранённому результату.
+     * Прогресс серий перепроверяется каждый раз по локальной истории,
+     * даты выхода — по сохранённому расписанию и локальному расписанию Lampa.
+     */
+    function shouldHide(entry, now, isWatched, localEpisodes) {
+        if (!entry || entry.status !== 'complete' || !entry.req) return false;
+
+        var age = now - entry.checked;
+
+        if (!(age >= -DAY && age <= HARD_TTL)) return false;
+
+        if (entry.nextAir && now >= entry.nextAir) return false;
+
+        var total = 0;
+
+        for (var season in entry.req) {
+            if (!Object.prototype.hasOwnProperty.call(entry.req, season)) continue;
+
+            var list = entry.req[season];
+
+            if (!isArray(list)) return false;
+
+            for (var i = 0; i < list.length; i++) {
+                total++;
+
+                if (!isWatched(toInt(season), list[i])) return false;
+            }
+        }
+
+        if (!total) return false;
+
+        if (isArray(localEpisodes)) {
+            for (var j = 0; j < localEpisodes.length; j++) {
+                var ep = localEpisodes[j] || {};
+                var s = toInt(ep.season_number);
+                var e = toInt(ep.episode_number);
+                var date = parseAirDate(ep.air_date);
+
+                if (s >= 1 && e >= 1 && !isNaN(date) && date <= now && !reqHas(entry.req, s, e) && !isWatched(s, e)) return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Нужна ли (пере)проверка сериала в TMDB
+     */
+    function needsCheck(entry, now) {
+        if (!entry) return true;
+
+        var age = now - entry.checked;
+
+        if (!(age >= 0)) return true;
+
+        if (entry.status === 'complete') {
+            if (entry.nextAir && now >= entry.nextAir) return true;
+
+            return age > SOFT_TTL;
+        }
+
+        if (entry.status === 'incomplete') return Boolean(entry.dirty) || age > INCOMPLETE_TTL;
+
+        return age > RETRY_TTL;
+    }
+
+    var Core = {
+        hashString: hashString,
+        episodeKey: episodeKey,
+        parseAirDate: parseAirDate,
+        isTvCard: isTvCard,
+        isAnimeCard: isAnimeCard,
+        titleCandidates: titleCandidates,
+        planSeasons: planSeasons,
+        seasonHasUnwatched: seasonHasUnwatched,
+        evaluate: evaluate,
+        shouldHide: shouldHide,
+        needsCheck: needsCheck,
+        SOFT_TTL: SOFT_TTL,
+        HARD_TTL: HARD_TTL,
+        RETRY_TTL: RETRY_TTL,
+        INCOMPLETE_TTL: INCOMPLETE_TTL
+    };
+
+    /* ======================================================================
+     * Runtime — подключение к Lampa
+     * ==================================================================== */
+
+    function install(win, options) {
+        options = options || {};
+
+        if (!win || win.__hws_installed) return win ? win.HideWatchedSeries : null;
+
+        win.__hws_installed = true;
+
+        var clock = options.now || function () {
+            return Date.now();
+        };
+        var timers = options.timers || {
+            set: function (fn, ms) {
+                return setTimeout(fn, ms);
+            },
+            interval: function (fn, ms) {
+                return setInterval(fn, ms);
+            }
+        };
+
+        var cache = null;
+        var queue = [];
+        var queued = {};
+        var busy = false;
+        var network = null;
+        var mode = 'none';
+        var started = false;
+        var categoryDepth = 0;
+        var originalContinues = null;
+        var warmupTimer = null;
+        var stats = { hidden: 0, checks: 0, errors: 0 };
+
+        function L() {
+            return win.Lampa;
+        }
+
+        /* ---------- настройки и журнал ---------- */
+
+        function setting(name, def) {
+            try {
+                // Без значения по умолчанию: Storage.get в 3.x делает `value || empty`
+                // и подменяет сохранённое булево false на значение по умолчанию.
+                // Пустой ответ уточняем по localStorage, куда Storage.set пишет строку
+                var value = L().Storage.get(name);
+
+                if (value === null || typeof value === 'undefined' || value === '') {
+                    var ls = storage();
+
+                    value = ls ? ls.getItem(name) : null;
+
+                    if (value === null || value === '') return def;
+                }
+                if (value === true || value === 'true') return true;
+                if (value === false || value === 'false') return false;
+
+                return value;
+            } catch (e) {
+                return def;
+            }
+        }
+
+        function enabled() {
+            return setting(SETTINGS.enabled, true) !== false;
+        }
+
+        function includeAnime() {
+            return setting(SETTINGS.anime, false) === true;
+        }
+
+        function threshold() {
+            var value = toInt(setting(SETTINGS.threshold, DEFAULT_THRESHOLD));
+
+            return value >= 50 && value <= 100 ? value : DEFAULT_THRESHOLD;
+        }
+
+        function debugOn() {
+            return setting(SETTINGS.debug, false) === true;
+        }
+
+        function log() {
+            if (!debugOn()) return;
+
+            try {
+                var args = Array.prototype.slice.call(arguments);
+
+                args.unshift(LOG_TAG);
+                console.log.apply(console, args);
+            } catch (e) {}
+        }
+
+        /* ---------- кеш ---------- */
+
+        function storage() {
+            try {
+                return win.localStorage || null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function loadCache() {
+            if (cache) return cache;
+
+            cache = {};
+
+            try {
+                var ls = storage();
+                var raw = ls ? ls.getItem(CACHE_KEY) : null;
+                var parsed = raw ? JSON.parse(raw) : null;
+
+                if (parsed && parsed.v === CACHE_VERSION && parsed.items && typeof parsed.items === 'object') cache = parsed.items;
+            } catch (e) {
+                cache = {};
+            }
+
+            return cache;
+        }
+
+        function saveCache() {
+            try {
+                var items = loadCache();
+                var ids = Object.keys(items);
+
+                if (ids.length > CACHE_LIMIT) {
+                    ids.sort(function (a, b) {
+                        return (items[a].checked || 0) - (items[b].checked || 0);
+                    });
+
+                    for (var i = 0; i < ids.length - CACHE_LIMIT; i++) delete items[ids[i]];
+                }
+
+                var ls = storage();
+
+                if (ls) ls.setItem(CACHE_KEY, JSON.stringify({ v: CACHE_VERSION, items: items }));
+            } catch (e) {
+                log('cache save error', e && e.message);
+            }
+        }
+
+        function clearCache() {
+            cache = {};
+            queue = [];
+            queued = {};
+
+            try {
+                var ls = storage();
+
+                if (ls) ls.removeItem(CACHE_KEY);
+            } catch (e) {}
+
+            log('cache cleared');
+        }
+
+        /* ---------- история просмотра ---------- */
+
+        function hash(str) {
+            try {
+                if (L().Utils && typeof L().Utils.hash === 'function') return L().Utils.hash(str);
+            } catch (e) {}
+
+            return hashString(str);
+        }
+
+        function percentOf(hashValue) {
+            try {
+                var view = L().Timeline.view(hashValue);
+                var percent = view ? parseFloat(view.percent) : 0;
+
+                return isNaN(percent) ? 0 : percent;
+            } catch (e) {
+                return 0;
+            }
+        }
+
+        function makeIsWatched(card) {
+            var titles = titleCandidates(card);
+            var limit = threshold();
+            var memo = {};
+
+            return function (season, episode) {
+                var key = season + ':' + episode;
+
+                if (Object.prototype.hasOwnProperty.call(memo, key)) return memo[key];
+
+                var best = 0;
+
+                for (var i = 0; i < titles.length && best < limit; i++) {
+                    best = Math.max(best, percentOf(hash(episodeKey(season, episode, titles[i]))));
+                }
+
+                // Lampa 3.x: поиск прогресса по привязке, если название карточки менялось
+                if (best < limit && L().Timeline && typeof L().Timeline.watchedEpisode === 'function') {
+                    try {
+                        var p = parseFloat(L().Timeline.watchedEpisode(card, season, episode));
+
+                        if (!isNaN(p)) best = Math.max(best, p);
+                    } catch (e) {}
+                }
+
+                memo[key] = best >= limit;
+
+                return memo[key];
+            };
+        }
+
+        function localEpisodes(card) {
+            try {
+                var tt = L().TimeTable;
+
+                if (tt && typeof tt.get === 'function') {
+                    var list = tt.get(card);
+
+                    return isArray(list) ? list : [];
+                }
+            } catch (e) {}
+
+            return [];
+        }
+
+        /* ---------- отбор карточек ---------- */
+
+        function eligible(card) {
+            if (!card || !isTvCard(card)) return false;
+            if (typeof card.id !== 'number' && !/^\d+$/.test(card.id + '')) return false;
+            if (card.source && card.source !== 'tmdb' && card.source !== 'cub') return false;
+            if (!titleCandidates(card).length) return false;
+            if (isAnimeCard(card) && !includeAnime()) return false;
+
+            return true;
+        }
+
+        function cardId(card) {
+            return toInt(card.id);
+        }
+
+        function hideCard(card) {
+            if (!eligible(card)) return false;
+
+            var entry = loadCache()[cardId(card)];
+
+            return shouldHide(entry, clock(), makeIsWatched(card), localEpisodes(card));
+        }
+
+        /**
+         * Фильтр списка строки «Продолжить просмотр». При любой ошибке
+         * возвращается исходный список.
+         */
+        function filterList(list, origin) {
+            if (!isArray(list) || !enabled()) return list;
+
+            try {
+                var out = [];
+                var hidden = [];
+
+                for (var i = 0; i < list.length; i++) {
+                    var card = list[i];
+                    var hide = false;
+
+                    try {
+                        hide = hideCard(card);
+                    } catch (e) {
+                        hide = false;
+                    }
+
+                    if (hide) hidden.push(card.original_name || card.name || card.id);
+                    else out.push(card);
+                }
+
+                stats.hidden = hidden.length;
+
+                log('row', origin, 'items:', list.length, 'hidden:', hidden.length, hidden.join(' | '));
+
+                scheduleChecks(list);
+
+                return out;
+            } catch (e) {
+                log('filter error', e && e.message);
+
+                return list;
+            }
+        }
+
+        /* ---------- запросы к TMDB ---------- */
+
+        function tmdbGet(path, ok, fail) {
+            var done = false;
+            var timer = timers.set(function () {
+                if (done) return;
+
+                done = true;
+                fail('timeout');
+            }, REQUEST_TIMEOUT);
+
+            function finish(fn, value) {
+                if (done) return;
+
+                done = true;
+
+                try {
+                    clearTimeout(timer);
+                } catch (e) {}
+
+                fn(value);
+            }
+
+            try {
+                if (options.fetch) return options.fetch(path, function (json) {
+                    finish(ok, json);
+                }, function (err) {
+                    finish(fail, err || 'network');
+                });
+
+                var lampa = L();
+
+                if (!network) network = new lampa.Reguest();
+
+                var lang = 'ru';
+
+                try {
+                    lang = lampa.Storage.field('tmdb_lang') || lang;
+                } catch (e) {}
+
+                var url = lampa.TMDB.api(path + (path.indexOf('?') >= 0 ? '&' : '?') + 'api_key=' + lampa.TMDB.key() + '&language=' + lang);
+
+                if (typeof network.timeout === 'function') network.timeout(REQUEST_TIMEOUT - 2000);
+
+                network.silent(url, function (json) {
+                    finish(ok, json);
+                }, function () {
+                    finish(fail, 'network');
+                });
+            } catch (e) {
+                finish(fail, 'exception: ' + (e && e.message));
+            }
+        }
+
+        /* ---------- проверка сериала ---------- */
+
+        function store(card, result) {
+            var items = loadCache();
+            var id = cardId(card);
+            var prev = items[id];
+            var now = clock();
+
+            if (result.status === 'error') {
+                stats.errors++;
+
+                // Ошибка сети не отменяет ранее подтверждённый результат: он остаётся
+                // в силе до наступления nextAir или истечения HARD_TTL
+                if (prev && prev.status === 'complete') {
+                    prev.error = result.reason;
+                    prev.errorAt = now;
+                } else {
+                    items[id] = { status: 'unknown', reason: result.reason, checked: now, title: card.original_name || card.name };
+                }
+            } else {
+                items[id] = {
+                    status: result.status,
+                    reason: result.reason,
+                    checked: now,
+                    nextAir: result.nextAir || 0,
+                    req: result.status === 'complete' ? result.req : undefined,
+                    title: card.original_name || card.name
+                };
+            }
+
+            log('checked', id, card.original_name || card.name, '→', items[id].status, items[id].reason || '', items[id].nextAir ? 'next: ' + new Date(items[id].nextAir).toDateString() : '');
+
+            saveCache();
+        }
+
+        function verify(card, done) {
+            var isWatched = makeIsWatched(card);
+            var id = cardId(card);
+
+            stats.checks++;
+
+            tmdbGet('tv/' + id, function (details) {
+                try {
+                    if (!details || toInt(details.id) !== id) {
+                        store(card, { status: 'unknown', reason: 'bad_details' });
+
+                        return done();
+                    }
+
+                    // Карточка без источника: сверяем оригинальное название
+                    if (!card.source && details.original_name && titleCandidates(card).indexOf(details.original_name) === -1) {
+                        store(card, { status: 'unknown', reason: 'title_mismatch' });
+
+                        return done();
+                    }
+
+                    var now = clock();
+                    var plan = planSeasons(details, now);
+
+                    if (plan.status !== 'ok') {
+                        store(card, { status: 'unknown', reason: plan.reason, nextAir: plan.nextAir });
+
+                        return done();
+                    }
+
+                    // Быстрый путь: последняя вышедшая серия не досмотрена
+                    if (plan.last && !isWatched(plan.last.season, plan.last.episode)) {
+                        store(card, { status: 'incomplete', reason: 'unwatched_last_s' + plan.last.season + 'e' + plan.last.episode, nextAir: plan.nextAir });
+
+                        return done();
+                    }
+
+                    var seasonsData = {};
+                    var index = 0;
+
+                    var next = function () {
+                        if (index >= plan.seasons.length) {
+                            store(card, evaluate(details, seasonsData, clock(), isWatched));
+
+                            return done();
+                        }
+
+                        var number = plan.seasons[index++];
+
+                        tmdbGet('tv/' + id + '/season/' + number, function (json) {
+                            try {
+                                if (!json || !isArray(json.episodes)) {
+                                    store(card, { status: 'unknown', reason: 'season_missing_' + number });
+
+                                    return done();
+                                }
+
+                                seasonsData[number] = json;
+
+                                var missed = seasonHasUnwatched(json, number, clock(), isWatched);
+
+                                if (missed) {
+                                    store(card, { status: 'incomplete', reason: 'unwatched_s' + missed.season + 'e' + missed.episode, nextAir: plan.nextAir });
+
+                                    return done();
+                                }
+
+                                next();
+                            } catch (e) {
+                                store(card, { status: 'error', reason: 'exception: ' + (e && e.message) });
+                                done();
+                            }
+                        }, function (err) {
+                            store(card, { status: 'error', reason: 'season_' + number + '_' + err });
+                            done();
+                        });
+                    };
+
+                    next();
+                } catch (e) {
+                    store(card, { status: 'error', reason: 'exception: ' + (e && e.message) });
+                    done();
+                }
+            }, function (err) {
+                store(card, { status: 'error', reason: 'details_' + err });
+                done();
+            });
+        }
+
+        function pump() {
+            if (busy || !queue.length) return;
+
+            busy = true;
+
+            var card = queue.shift();
+            var finished = false;
+
+            verify(card, function () {
+                if (finished) return;
+
+                finished = true;
+                delete queued[cardId(card)];
+                busy = false;
+
+                timers.set(pump, 300);
+            });
+        }
+
+        function enqueue(card) {
+            if (!eligible(card)) return;
+
+            var id = cardId(card);
+
+            if (queued[id]) return;
+            if (!needsCheck(loadCache()[id], clock())) return;
+
+            queued[id] = true;
+
+            // Копия только нужных полей: оригинальная карточка не меняется
+            queue.push({
+                id: id,
+                source: card.source,
+                name: card.name,
+                original_name: card.original_name,
+                original_title: card.original_title,
+                original_language: card.original_language,
+                number_of_seasons: card.number_of_seasons,
+                first_air_date: card.first_air_date
+            });
+
+            pump();
+        }
+
+        function scheduleChecks(list) {
+            if (!isArray(list)) return;
+
+            for (var i = 0; i < list.length; i++) {
+                try {
+                    enqueue(list[i]);
+                } catch (e) {}
+            }
+        }
+
+        /* ---------- источник списка для фоновой проверки ---------- */
+
+        function continueList() {
+            var lampa = L();
+            var list = [];
+
+            try {
+                var fn = mode === 'legacy' && originalContinues ? originalContinues : lampa.Favorite.continues;
+
+                list = list.concat(fn.call(lampa.Favorite, 'tv') || []);
+
+                if (mode === 'rows' && includeAnime()) list = list.concat(fn.call(lampa.Favorite, 'anime') || []);
+            } catch (e) {
+                log('continues error', e && e.message);
+            }
+
+            return list;
+        }
+
+        function warmup() {
+            if (!enabled()) return;
+
+            var list = continueList();
+
+            log('warmup, series in list:', list.length);
+            scheduleChecks(list);
+        }
+
+        function scheduleWarmup(delay) {
+            if (warmupTimer) {
+                try {
+                    clearTimeout(warmupTimer);
+                } catch (e) {}
+            }
+
+            warmupTimer = timers.set(function () {
+                warmupTimer = null;
+                warmup();
+            }, delay);
+        }
+
+        /* ---------- перехват строки ---------- */
+
+        /**
+         * Lampa 2.3.0: строку строят tmdb.category / cub.category вызовом
+         * Favorite.continues(params.url) — свойство экспортированного объекта,
+         * то есть тот же объект, что Lampa.Favorite. Фильтруем только вызовы
+         * изнутри category(), остальные (плеер, Tizen) не трогаем.
+         */
+        function patchLegacy() {
+            var lampa = L();
+            var favorite = lampa.Favorite;
+
+            if (!favorite || typeof favorite.continues !== 'function') return false;
+
+            if (favorite.continues.__hws) {
+                originalContinues = favorite.continues.__hws;
+
+                return true;
+            }
+
+            originalContinues = favorite.continues;
+
+            var wrapped = function (type) {
+                var result = originalContinues.apply(this, arguments);
+
+                if (categoryDepth > 0 && type === 'tv') return filterList(result, 'category:tv');
+
+                return result;
+            };
+
+            wrapped.__hws = originalContinues;
+            favorite.continues = wrapped;
+
+            var sources = lampa.Api && lampa.Api.sources ? lampa.Api.sources : {};
+            var names = [];
+
+            for (var name in sources) {
+                var source;
+
+                try {
+                    source = sources[name];
+                } catch (e) {
+                    continue;
+                }
+
+                if (!source || typeof source.category !== 'function' || source.category.__hws) continue;
+
+                (function (src) {
+                    var original = src.category;
+                    var wrappedCategory = function () {
+                        categoryDepth++;
+
+                        try {
+                            return original.apply(this, arguments);
+                        } finally {
+                            categoryDepth--;
+                        }
+                    };
+
+                    wrappedCategory.__hws = original;
+                    src.category = wrappedCategory;
+                })(source);
+
+                names.push(name);
+            }
+
+            log('legacy mode, sources:', names.join(','));
+
+            return names.length > 0;
+        }
+
+        /**
+         * Lampa 3.x: строка регистрируется через ContentRows.add, список строит
+         * внутренняя функция favorite.js. Подменяем ответ только у строки,
+         * чей заголовок — «Продолжить просмотр».
+         */
+        function patchRows() {
+            var rows = L().ContentRows;
+
+            if (!rows || typeof rows.call !== 'function') return false;
+            if (rows.call.__hws) return true;
+
+            var original = rows.call;
+
+            var wrapped = function (screen, params, calls) {
+                var before = isArray(calls) ? calls.slice() : null;
+                var result = original.apply(this, arguments);
+
+                if (before && (screen === 'main' || screen === 'category')) {
+                    for (var i = 0; i < calls.length; i++) {
+                        var fn = calls[i];
+
+                        if (typeof fn === 'function' && !fn.__hws_row && before.indexOf(fn) === -1) calls[i] = wrapRow(fn, screen);
+                    }
+                }
+
+                return result;
+            };
+
+            wrapped.__hws = original;
+            rows.call = wrapped;
+
+            log('rows mode');
+
+            return true;
+        }
+
+        function continueTitle() {
+            try {
+                return L().Lang.translate('title_continue');
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function wrapRow(fn, screen) {
+            var wrapped = function (call) {
+                var args = Array.prototype.slice.call(arguments);
+
+                if (typeof call === 'function') {
+                    args[0] = function (json) {
+                        try {
+                            var title = continueTitle();
+
+                            if (json && title && json.title === title && isArray(json.results)) json.results = filterList(json.results, screen);
+                        } catch (e) {}
+
+                        return call.apply(this, arguments);
+                    };
+                }
+
+                return fn.apply(this, args);
+            };
+
+            wrapped.__hws_row = true;
+
+            return wrapped;
+        }
+
+        /* ---------- настройки в интерфейсе ---------- */
+
+        function addSettings() {
+            var api = L().SettingsApi;
+
+            if (!api || typeof api.addComponent !== 'function') return;
+
+            var component = 'hide_watched_series';
+
+            try {
+                api.addComponent({
+                    component: component,
+                    name: 'Просмотренные сериалы',
+                    icon: '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 5h18v11H3z" stroke="white" stroke-width="2"/><path d="M8 20h8" stroke="white" stroke-width="2"/><path d="M8.5 10.5l2.5 2.5 4.5-5" stroke="white" stroke-width="2"/></svg>'
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: SETTINGS.enabled, type: 'trigger', 'default': true },
+                    field: { name: 'Убирать досмотренные сериалы', description: 'Из строки «Продолжить просмотр», пока не выйдет новая серия' }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: SETTINGS.anime, type: 'trigger', 'default': false },
+                    field: { name: 'Обрабатывать аниме', description: 'Выключено: аниме никогда не скрывается' }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: {
+                        name: SETTINGS.threshold,
+                        type: 'select',
+                        values: { '80': '80%', '85': '85%', '90': '90%', '95': '95%', '100': '100%' },
+                        'default': DEFAULT_THRESHOLD + ''
+                    },
+                    field: { name: 'Серия досмотрена при прогрессе от', description: 'Плеер Lampa не предлагает продолжить серию после 90%' }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: SETTINGS.debug, type: 'trigger', 'default': false },
+                    field: { name: 'Режим отладки', description: 'Сообщения с меткой HideWatched в консоли Lampa' }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: 'hws_clear_cache', type: 'button' },
+                    field: { name: 'Очистить данные плагина', description: 'Удалить сохранённые результаты проверок' },
+                    onChange: function () {
+                        clearCache();
+
+                        try {
+                            L().Noty.show('Данные плагина очищены');
+                        } catch (e) {}
+
+                        scheduleWarmup(1000);
+                    }
+                });
+            } catch (e) {
+                log('settings error', e && e.message);
+            }
+        }
+
+        /* ---------- запуск ---------- */
+
+        function onTimelineUpdate() {
+            var items = loadCache();
+
+            for (var id in items) {
+                if (Object.prototype.hasOwnProperty.call(items, id) && items[id].status === 'incomplete') items[id].dirty = true;
+            }
+
+            scheduleWarmup(5000);
+        }
+
+        function start() {
+            if (started) return;
+
+            started = true;
+
+            try {
+                var lampa = L();
+
+                if (lampa.ContentRows && typeof lampa.ContentRows.call === 'function') mode = patchRows() ? 'rows' : 'none';
+                else mode = patchLegacy() ? 'legacy' : 'none';
+
+                addSettings();
+
+                try {
+                    if (lampa.Timeline && lampa.Timeline.listener && typeof lampa.Timeline.listener.follow === 'function') {
+                        lampa.Timeline.listener.follow('update', onTimelineUpdate);
+                    }
+                } catch (e) {}
+
+                try {
+                    if (lampa.Manifest) {
+                        lampa.Manifest.plugins = {
+                            type: 'other',
+                            version: VERSION,
+                            name: 'Убирать просмотренные сериалы',
+                            description: 'Скрывает досмотренные сериалы из «Продолжить просмотр»',
+                            component: 'hide_watched_series'
+                        };
+                    }
+                } catch (e) {}
+
+                log('started, version', VERSION, 'mode', mode, 'lampa', lampa.Manifest ? lampa.Manifest.app_version : '?');
+
+                if (mode !== 'none') {
+                    scheduleWarmup(options.warmupDelay || 4000);
+                    timers.interval(warmup, 30 * 60 * 1000);
+                }
+            } catch (e) {
+                try {
+                    console.error(LOG_TAG, 'start error', e && e.message);
+                } catch (x) {}
+            }
+        }
+
+        function boot() {
+            var lampa = L();
+
+            if (win.appready) return start();
+
+            if (lampa && lampa.Listener && typeof lampa.Listener.follow === 'function') {
+                lampa.Listener.follow('app', function (e) {
+                    if (e && e.type === 'ready') start();
+                });
+            } else {
+                timers.set(boot, 500);
+            }
+        }
+
+        var api = {
+            version: VERSION,
+            Core: Core,
+            mode: function () {
+                return mode;
+            },
+            start: start,
+            warmup: warmup,
+            clearCache: clearCache,
+            // Удалить все данные плагина: кеш проверок и его настройки
+            purge: function () {
+                clearCache();
+
+                var ls = storage();
+
+                for (var key in SETTINGS) {
+                    if (!Object.prototype.hasOwnProperty.call(SETTINGS, key)) continue;
+
+                    try {
+                        if (ls) ls.removeItem(SETTINGS[key]);
+                    } catch (e) {}
+                }
+            },
+            filterList: filterList,
+            hideCard: hideCard,
+            cache: function () {
+                return loadCache();
+            },
+            stats: function () {
+                return { hidden: stats.hidden, checks: stats.checks, errors: stats.errors, queue: queue.length, busy: busy };
+            },
+            status: function () {
+                var items = loadCache();
+                var rows = [];
+
+                for (var id in items) {
+                    if (!Object.prototype.hasOwnProperty.call(items, id)) continue;
+
+                    var it = items[id];
+
+                    rows.push(id + ' ' + (it.title || '') + ': ' + it.status + ' (' + (it.reason || '') + ')' + (it.nextAir ? ', next ' + new Date(it.nextAir).toDateString() : '') + ', checked ' + new Date(it.checked).toLocaleString());
+                }
+
+                try {
+                    console.log(LOG_TAG, 'mode:', mode, 'version:', VERSION, '\n' + rows.join('\n'));
+                } catch (e) {}
+
+                return rows;
+            }
+        };
+
+        win.HideWatchedSeries = api;
+
+        if (options.autoStart !== false) boot();
+
+        return api;
+    }
+
+    var exported = { Core: Core, install: install, VERSION: VERSION };
+
+    if (typeof module === 'object' && module && module.exports) module.exports = exported;
+    else if (root) install(root);
+})(typeof window !== 'undefined' ? window : this);

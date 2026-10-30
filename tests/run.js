@@ -1247,6 +1247,183 @@ checkAsync('F14', 'Значки закладок вверху: плашка оп
     return [plain, withIcon, low(), el.querySelectorAll('.hws-watched-badge').length];
 });
 
+/* ---------------- Плашка «Просмотрено» у завершённых сериалов ---------------- */
+
+function finishedShow(env, id, status, seasons, extra) {
+    const added = env.addShow(id, 'Show' + id, seasons || [{ n: 1, eps: [-30, -20] }, { n: 2, eps: [-10] }], extra);
+
+    added.show.patchDetails = (d) => { if (status) d.status = status; };
+
+    return added;
+}
+
+checkAsync('W1', 'Завершённый сериал, все серии досмотрены: плашка в каталоге и на постере страницы', [1, 1, 'Просмотрено', true], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 501, 'Ended');
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    const page = env.openMovie(a.card);
+
+    await env.tick();
+
+    return [env.badges(env.document.querySelector('.items-line')), page.posterBadges(), env.document.querySelector('.hws-watched-badge').textContent, env.win.HideWatchedSeries.isSeriesFinished(a.card)];
+});
+
+checkAsync('W2', 'Отменённый сериал считается завершённым, в том числе вне истории просмотра', [1], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 502, 'Canceled', null, { notInHistory: true });
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    return [env.badges()];
+});
+
+checkAsync('W3', 'Идущий сериал, всё досмотрено: скрывается, но плашки нет', [0, 'complete', false], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 503, 'Returning Series');
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    const api = env.win.HideWatchedSeries;
+
+    return [env.badges(), api.cache()[503].status, api.cache()[503].ended];
+});
+
+checkAsync('W4', 'Завершённый сериал, не все серии досмотрены: плашки нет', [0, 'incomplete'], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 504, 'Ended');
+
+    env.watchAll(a.card, a.show, 100, (s, e) => !(s === 1 && e === 2));
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    return [env.badges(), env.win.HideWatchedSeries.cache()[504].status];
+});
+
+checkAsync('W5', 'Сериал, который не начинали смотреть: запросов в TMDB нет', [0, 0], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 505, 'Ended', null, { notInHistory: true });
+
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    return [env.badges(), env.tmdb.log.length];
+});
+
+checkAsync('W6', 'Статус «завершён», но есть будущая серия или серия без даты: плашки нет', [0, 0], async () => {
+    const env = await domEnv();
+    const future = finishedShow(env, 506, 'Ended', [{ n: 1, eps: [-30, 10] }]);
+    const undated = finishedShow(env, 507, 'Ended', [{ n: 1, eps: [-30, null] }]);
+
+    env.watchAll(future.card, future.show);
+    env.watchAll(undated.card, undated.show);
+
+    const line = env.line();
+
+    line.appendChild(env.makeCard(future.card));
+    await env.tick();
+
+    const first = env.badges();
+
+    line.appendChild(env.makeCard(undated.card));
+    await env.tick();
+
+    return [first, env.badges()];
+});
+
+checkAsync('W7', 'Снятие отметки с серии убирает плашку без перезагрузки', [1, 0], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 508, 'Ended');
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    const before = env.badges();
+
+    env.watch(a.card, 1, 2, 10);
+    await env.tick();
+
+    return [before, env.badges()];
+});
+
+checkAsync('W8', 'Массовая отметка завершённого сериала сразу даёт плашку', [0, 1, 'ok'], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 509, 'Ended');
+
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    const before = env.badges();
+    let status = null;
+
+    env.win.HideWatchedSeries.markAllAired(a.card, (r) => { status = r.status; });
+    await env.tick();
+
+    return [before, env.badges(), status];
+});
+
+checkAsync('W9', 'Запись старой версии без статуса перепроверяется и получает плашку', [true, true, 1], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 510, 'Ended');
+    const api = env.win.HideWatchedSeries;
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    delete api.cache()[510].ended;
+
+    const before = env.tmdb.log.length;
+
+    api.scanBadges();
+    await env.tick();
+
+    return [env.tmdb.log.length > before, api.cache()[510].ended, env.badges()];
+});
+
+checkAsync('W10', 'Без сети старая запись не перезапрашивается при каждой отрисовке', [1], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 511, 'Ended');
+    const api = env.win.HideWatchedSeries;
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    delete api.cache()[511].ended;
+    env.tmdb.fail = true;
+
+    const before = env.tmdb.log.length;
+
+    api.scanBadges();
+    await env.tick();
+    api.scanBadges();
+    await env.tick();
+    api.scanBadges();
+    await env.tick();
+
+    return [env.tmdb.log.length - before];
+});
+
+checkAsync('W11', 'Аниме без включённой настройки плашку не получает', [0, 0], async () => {
+    const env = await domEnv();
+    const a = finishedShow(env, 512, 'Ended', null, { lang: 'ja' });
+
+    env.watchAll(a.card, a.show);
+    env.line().appendChild(env.makeCard(a.card));
+    await env.tick();
+
+    return [env.badges(), env.tmdb.log.filter((p) => p.indexOf('tv/512') === 0).length];
+});
+
 /* ---------------- «Продолжить» с последнего торрента ---------------- */
 
 const SERIES = { id: 247718, source: 'tmdb', name: 'MobLand', original_name: 'MobLand', original_title: 'MobLand', first_air_date: '2025-03-30', number_of_seasons: 2, img: 'poster.jpg' };

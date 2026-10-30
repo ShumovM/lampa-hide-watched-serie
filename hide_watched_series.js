@@ -1,12 +1,13 @@
 /*!
  * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
- * Версия 1.3.0
+ * Версия 1.4.0
  *
  * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
  * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
  * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными»
  * и «Продолжить» — открывает последнюю раздачу с курсором на следующей серии.
  * На странице фильма — кнопку «Отметить просмотренным» и зелёную плашку на постере.
+ * Такая же плашка у завершённых сериалов, все серии которых досмотрены.
  *
  * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
  * ветка 3.x, где строка строится через Lampa.ContentRows.
@@ -16,7 +17,7 @@
 (function (root) {
     'use strict';
 
-    var VERSION = '1.3.0';
+    var VERSION = '1.4.0';
     var LOG_TAG = 'HideWatched';
 
     var CACHE_KEY = 'hws_cache';
@@ -234,6 +235,23 @@
     }
 
     /**
+     * Сериал больше не выйдет: статус TMDB (не переводится) «завершён» или «отменён»,
+     * нет будущих серий, серий без даты и ещё не начавшихся сезонов
+     */
+    function seriesEnded(details, plan, nextAir, undatedPending) {
+        if (details.status !== 'Ended' && details.status !== 'Canceled') return false;
+        if (nextAir || undatedPending || details.next_episode_to_air) return false;
+
+        var maxLoaded = Math.max.apply(null, plan.seasons);
+
+        for (var i = 0; i < details.seasons.length; i++) {
+            if (toInt(details.seasons[i] && details.seasons[i].season_number) > maxLoaded) return false;
+        }
+
+        return true;
+    }
+
+    /**
      * Полная проверка сериала.
      * @param {object} details - ответ TMDB tv/{id}
      * @param {object} seasonsData - {номер_сезона: ответ TMDB tv/{id}/season/{n}}
@@ -334,7 +352,8 @@
             reason: 'all_watched',
             req: req,
             count: count,
-            nextAir: nextAir
+            nextAir: nextAir,
+            ended: seriesEnded(details, plan, nextAir, undatedPending)
         };
     }
 
@@ -385,6 +404,13 @@
     }
 
     /**
+     * Показывать ли плашку «Просмотрено» на сериале
+     */
+    function isFinished(entry, now, isWatched, localEpisodes) {
+        return Boolean(entry && entry.ended) && shouldHide(entry, now, isWatched, localEpisodes);
+    }
+
+    /**
      * Нужна ли (пере)проверка сериала в TMDB
      */
     function needsCheck(entry, now) {
@@ -396,6 +422,9 @@
 
         if (entry.status === 'complete') {
             if (entry.nextAir && now >= entry.nextAir) return true;
+
+            // Запись версии до 1.4.0: неизвестно, завершён ли сериал
+            if (typeof entry.ended === 'undefined') return true;
 
             return age > SOFT_TTL;
         }
@@ -416,6 +445,7 @@
         seasonHasUnwatched: seasonHasUnwatched,
         evaluate: evaluate,
         shouldHide: shouldHide,
+        isFinished: isFinished,
         needsCheck: needsCheck,
         SOFT_TTL: SOFT_TTL,
         HARD_TTL: HARD_TTL,
@@ -789,6 +819,7 @@
                     checked: now,
                     nextAir: result.nextAir || 0,
                     req: result.status === 'complete' ? result.req : undefined,
+                    ended: result.status === 'complete' ? Boolean(result.ended) : undefined,
                     title: card.original_name || card.name
                 };
             }
@@ -796,6 +827,8 @@
             log('checked', id, card.original_name || card.name, '→', items[id].status, items[id].reason || '', items[id].nextAir ? 'next: ' + new Date(items[id].nextAir).toDateString() : '');
 
             saveCache();
+
+            if ((prev && prev.ended) || items[id].ended) updateBadges();
         }
 
         function verify(card, done) {
@@ -1311,6 +1344,7 @@
                 if (!series) return addMovieButton(movie, render, container);
 
                 addContinueButton(movie, container);
+                addSeriesPoster(movie, render);
 
                 if (container.find('.button--hws-mark').length) return;
 
@@ -1465,6 +1499,35 @@
             return win.document || null;
         }
 
+        function isSeriesFinished(card) {
+            if (!eligible(card)) return false;
+
+            var entry = loadCache()[cardId(card)];
+
+            if (!entry || !entry.ended) return false;
+
+            return isFinished(entry, clock(), makeIsWatched(card), localEpisodes(card));
+        }
+
+        function isCardWatched(card) {
+            return isMovieCard(card) ? isMovieWatched(card) : isSeriesFinished(card);
+        }
+
+        /**
+         * Проверка сериала с карточки: запросы в TMDB только для тех, что уже начинали
+         * смотреть. Без первой серии досмотренным сериал быть не может
+         */
+        function checkSeries(card) {
+            if (!eligible(card)) return;
+
+            var entry = loadCache()[cardId(card)];
+
+            // Карточка отрисовывается часто: без сети не повторять запрос при каждой отрисовке
+            if (entry && entry.errorAt && clock() - entry.errorAt < RETRY_TTL) return;
+
+            if (entry || makeIsWatched(card)(1, 1)) enqueue(card);
+        }
+
         function createBadge() {
             var badge = doc().createElement('div');
 
@@ -1500,7 +1563,9 @@
 
             if (!view) return;
 
-            var show = isMovieCard(card) && isMovieWatched(card);
+            if (isTvCard(card)) checkSeries(card);
+
+            var show = isCardWatched(card);
 
             syncBadge(view, show);
 
@@ -1645,7 +1710,7 @@
             }
         }
 
-        /* Страница фильма: кнопка и плашка на постере */
+        /* Страница фильма или сериала: плашка на постере, у фильма ещё и кнопка */
 
         var fullPoster = null;
 
@@ -1661,15 +1726,32 @@
                     return;
                 }
 
-                var on = isMovieWatched(fullPoster.movie);
+                var on = isCardWatched(fullPoster.movie);
 
                 syncBadge(view, on);
+
+                if (!fullPoster.button) return;
 
                 fullPoster.button.toggleClass('hws-movie--on', on);
                 fullPoster.button.find('span').text(on ? MOVIE_UNMARK_LABEL : MOVIE_MARK_LABEL);
             } catch (e) {
                 log('full poster error', e && e.message);
             }
+        }
+
+        function posterView(render) {
+            var poster = render.find('.full-start-new__poster');
+
+            if (!poster.length) poster = render.find('.full-start__poster');
+
+            return poster.length ? poster[0] : null;
+        }
+
+        function addSeriesPoster(movie, render) {
+            fullPoster = { movie: movie, button: null, view: posterView(render) };
+
+            checkSeries(movie);
+            updateFullPoster();
         }
 
         function addMovieButton(movie, render, container) {
@@ -1681,11 +1763,7 @@
                 '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1.5 12S5.5 4.5 12 4.5 22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12z" stroke="currentColor" stroke-width="2"/><path d="M8.5 12l2.5 2.5 4.5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
                 '<span>' + (on ? MOVIE_UNMARK_LABEL : MOVIE_MARK_LABEL) + '</span></div>');
 
-            var poster = render.find('.full-start-new__poster');
-
-            if (!poster.length) poster = render.find('.full-start__poster');
-
-            var page = { movie: movie, button: button, view: poster.length ? poster[0] : null };
+            var page = { movie: movie, button: button, view: posterView(render) };
 
             fullPoster = page;
 
@@ -2051,6 +2129,8 @@
 
             warmupTimer = timers.set(function () {
                 warmupTimer = null;
+                // Прогресс мог измениться: плашки сериалов пересчитываются по свежей истории
+                updateBadges();
                 warmup();
             }, delay);
         }
@@ -2368,6 +2448,7 @@
             markAllAired: markAllAired,
             markMessage: markMessage,
             isMovieWatched: isMovieWatched,
+            isSeriesFinished: isSeriesFinished,
             setMovieWatched: setMovieWatched,
             toggleMovieWatched: toggleMovieWatched,
             movieKey: movieKey,

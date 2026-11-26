@@ -1354,7 +1354,7 @@ checkAsync('F12', 'Нет бесконечного цикла: вставка с
     return [env.badges(), env.pending.length];
 });
 
-checkAsync('F13', 'Стиль: маленькая галочка в правом верхнем углу, внутри .card__view', [1, true, true], async () => {
+checkAsync('F13', 'Стиль: зелёный треугольный уголок с белой галочкой внутри .card__view', [1, true, true], async () => {
     const env = await domEnv();
 
     env.win.HideWatchedSeries.setMovieWatched(movie(), true);
@@ -1364,10 +1364,10 @@ checkAsync('F13', 'Стиль: маленькая галочка в правом
     const css = env.document.getElementById('hws-style').textContent;
     const badge = env.document.querySelector('.hws-watched-badge');
 
-    return [env.badges(), /\.hws-watched-badge\{position:absolute;top:\.35em;right:\.35em;/.test(css) && css.indexOf('width:1.25em') !== -1 && css.indexOf('bottom:') === -1, badge.parentNode.className === 'card__view'];
+    return [env.badges(), /\.hws-watched-badge\{position:absolute;top:0;right:0;/.test(css) && css.indexOf('.hws-watched-badge:before{content:"";') !== -1 && css.indexOf('border-top:3.5em solid #00c853') !== -1 && css.indexOf('color:#fff') !== -1 && css.indexOf('clip-path') === -1, badge.parentNode.className === 'card__view'];
 });
 
-checkAsync('F14', 'Маленькая галочка остаётся в углу с закладками и без них', [false, false, false, 1], async () => {
+checkAsync('F14', 'Треугольная отметка остаётся в углу с закладками и без них', [false, false, false, 1], async () => {
     const env = await domEnv();
     const el = env.makeCard(movie());
     const badge = () => el.querySelector('.hws-watched-badge');

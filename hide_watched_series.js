@@ -2197,12 +2197,12 @@
 
             style.id = 'hws-style';
             style.textContent = [
-                // Маленькая зелёная галочка в углу не перекрывает содержимое постера
-                '.' + BADGE_CLASS + '{position:absolute;top:.35em;right:.35em;z-index:3;width:1.25em;height:1.25em;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;-webkit-box-pack:center;-webkit-justify-content:center;justify-content:center;',
-                '-webkit-border-radius:50%;border-radius:50%;background:rgba(0,0,0,.72);color:#2ec27a;line-height:1;pointer-events:none}',
-                '.' + BADGE_CLASS + ' svg{width:.9em;height:.9em;display:block}',
+                // Зелёный треугольный уголок с белой галочкой, как на постерах Lampa
+                '.' + BADGE_CLASS + '{position:absolute;top:0;right:0;z-index:3;width:3.5em;height:3.5em;pointer-events:none}',
+                '.' + BADGE_CLASS + ':before{content:"";position:absolute;top:0;right:0;width:0;height:0;border-top:3.5em solid #00c853;border-left:3.5em solid transparent}',
+                '.' + BADGE_CLASS + ' svg{position:absolute;top:.16em;right:.16em;width:1.35em;height:1.35em;display:block;color:#fff}',
                 '.' + BADGE_CLASS + '__label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}',
-                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.55em;right:.55em;font-size:1.1em}',
+                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{font-size:1.1em}',
                 '.button--hws-movie.hws-movie--on svg{color:#2ec27a}'
             ].join('');
 

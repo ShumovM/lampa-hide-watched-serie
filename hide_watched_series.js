@@ -1,12 +1,12 @@
 /*!
  * Lampa plugin «Убирать просмотренные сериалы» (hide_watched_series)
- * Версия 1.4.0
+ * Версия 1.5.0
  *
  * Убирает из строки «Продолжить просмотр» сериалы, у которых все вышедшие серии
  * досмотрены, и возвращает их, как только выходит новая непросмотренная серия.
  * На странице сериала добавляет кнопку «Отметить все вышедшие серии просмотренными»
  * и «Продолжить» — открывает последнюю раздачу с курсором на следующей серии.
- * На странице фильма — кнопку «Отметить просмотренным» и зелёную плашку на постере.
+ * На странице фильма — кнопку «Отметить просмотренным» и зелёную галочку на постере.
  * Такая же плашка у завершённых сериалов, все серии которых досмотрены.
  *
  * Целевая платформа: Lampa 2.3.0 (LG webOS). Дополнительно поддерживается
@@ -17,7 +17,7 @@
 (function (root) {
     'use strict';
 
-    var VERSION = '1.4.0';
+    var VERSION = '1.5.0';
     var LOG_TAG = 'HideWatched';
 
     var CACHE_KEY = 'hws_cache';
@@ -41,7 +41,10 @@
         enabled: 'hws_enabled',
         anime: 'hws_anime',
         threshold: 'hws_threshold',
-        debug: 'hws_debug'
+        debug: 'hws_debug',
+        syncUrl: 'hws_sync_url',
+        syncCode: 'hws_sync_code',
+        syncId: 'hws_sync_id'
     };
 
     var DEFAULT_THRESHOLD = 90;
@@ -555,6 +558,491 @@
             } catch (e) {
                 return null;
             }
+        }
+
+        /* ---------- фоновая синхронизация Supabase ---------- */
+
+        var SYNC_QUEUE_KEY = 'hws_sync_queue';
+        var SYNC_QUEUE_VERSION = 1;
+        var SYNC_BATCH = 100;
+        var SYNC_PAGE = 300;
+        var SYNC_INTERVAL = 5 * 60 * 1000;
+        var syncQueue = null;
+        var syncBusy = false;
+        var syncApplying = false;
+        var syncStarted = false;
+        var syncTimer = null;
+        var syncRemoteSeen = null;
+        var syncLastError = '';
+        var syncLastSuccess = 0;
+        var syncRequestId = 0;
+
+        function syncString(value) {
+            return typeof value === 'string' ? value.replace(/^\s+|\s+$/g, '') : '';
+        }
+
+        function syncEndpoint() {
+            var value = syncString(setting(SETTINGS.syncUrl, ''));
+
+            if (!value) return '';
+            value = value.replace(/\/+$/, '');
+
+            return /\/functions\/v1\/swift-task$/i.test(value) ? value : value + '/functions/v1/swift-task';
+        }
+
+        function syncCode() {
+            return syncString(setting(SETTINGS.syncCode, ''));
+        }
+
+        function syncNamespace() {
+            var value = syncString(setting(SETTINGS.syncId, 'default'));
+
+            return value ? value.slice(0, 128) : 'default';
+        }
+
+        function syncProfile() {
+            try {
+                var account = L().Storage.get('account');
+
+                if (typeof account === 'string') account = JSON.parse(account);
+                if (account && account.profile && typeof account.profile.id !== 'undefined') return String(account.profile.id);
+
+                var timeline = L().Timeline;
+                var filename = timeline && typeof timeline.filename === 'function' ? timeline.filename() : '';
+                var match = /file_view_(.+)$/.exec(filename || '');
+
+                return match ? match[1] : '0';
+            } catch (e) {
+                return '0';
+            }
+        }
+
+        function syncTime(value) {
+            if (typeof value === 'number' && isFinite(value)) return value;
+            if (value === null || typeof value === 'undefined' || value === '') return 0;
+
+            var parsed = new Date(value).getTime();
+
+            return isNaN(parsed) ? 0 : parsed;
+        }
+
+        function syncIso(value) {
+            var time = value === null || typeof value === 'undefined' || value === '' ? clock() : syncTime(value);
+
+            try {
+                return new Date(time).toISOString();
+            } catch (e) {
+                return new Date(clock()).toISOString();
+            }
+        }
+
+        function syncLoadQueue() {
+            if (syncQueue) return syncQueue;
+
+            syncQueue = [];
+
+            try {
+                var ls = storage();
+                var raw = ls ? ls.getItem(SYNC_QUEUE_KEY) : null;
+                var parsed = raw ? JSON.parse(raw) : null;
+
+                if (parsed && parsed.v === SYNC_QUEUE_VERSION && isArray(parsed.items)) syncQueue = parsed.items;
+            } catch (e) {
+                syncQueue = [];
+            }
+
+            return syncQueue;
+        }
+
+        function syncSaveQueue() {
+            try {
+                var ls = storage();
+
+                if (ls) ls.setItem(SYNC_QUEUE_KEY, JSON.stringify({ v: SYNC_QUEUE_VERSION, items: syncLoadQueue() }));
+            } catch (e) {
+                log('sync queue save error', e && e.message);
+            }
+        }
+
+        function syncQueueKey(table, row) {
+            if (table === 'episode_progress') return table + '|' + row.profile_id + '|' + row.timeline_hash;
+            if (table === 'movie_watched_marks') return table + '|' + row.profile_id + '|' + row.source + '|' + row.movie_id;
+
+            return table + '|' + row.profile_id + '|' + row.source + '|' + row.series_id;
+        }
+
+        function syncEnqueue(table, row, updated) {
+            if (syncApplying || !row) return;
+
+            var items = syncLoadQueue();
+            var key = syncQueueKey(table, row);
+            var stamp = syncTime(updated || row.updated_at) || clock();
+            var item = {
+                id: String(clock()) + '-' + String(++syncRequestId),
+                table: table,
+                key: key,
+                updated: stamp,
+                row: row
+            };
+            var replaced = false;
+
+            for (var i = 0; i < items.length; i++) {
+                if (items[i].key === key) {
+                    if ((items[i].updated || 0) > stamp) return;
+                    items[i] = item;
+                    replaced = true;
+                    break;
+                }
+            }
+
+            if (!replaced) items.push(item);
+            syncSaveQueue();
+            scheduleSync(1200);
+        }
+
+        function scheduleSync(delay) {
+            if (syncTimer) return;
+
+            syncTimer = timers.set(function () {
+                syncTimer = null;
+                syncNow();
+            }, typeof delay === 'number' ? delay : 1000);
+        }
+
+        function syncRequest(url, code, body, callback) {
+            if (typeof options.syncRequest === 'function') return options.syncRequest(url, code, body, callback);
+
+            var XHR = win.XMLHttpRequest;
+
+            if (!XHR) return callback('xhr_unavailable');
+
+            try {
+                var request = new XHR();
+
+                request.open('POST', url, true);
+                request.timeout = 20000;
+                request.setRequestHeader('Content-Type', 'application/json');
+                request.setRequestHeader('x-sync-code', code);
+                request.onreadystatechange = function () {
+                    if (request.readyState !== 4) return;
+                    if (request.status < 200 || request.status >= 300) return callback('http_' + request.status);
+
+                    var response;
+
+                    try {
+                        response = JSON.parse(request.responseText || '{}');
+                    } catch (e) {
+                        return callback('invalid_json');
+                    }
+
+                    callback(null, response);
+                };
+                request.onerror = function () { callback('network'); };
+                request.ontimeout = function () { callback('timeout'); };
+                request.send(JSON.stringify(body));
+            } catch (e) {
+                callback('request_error');
+            }
+        }
+
+        function syncPrepareRow(table, row) {
+            var copy = {};
+            var key;
+
+            for (key in row) if (Object.prototype.hasOwnProperty.call(row, key)) copy[key] = row[key];
+            copy.sync_id = syncNamespace();
+            copy.profile_id = syncProfile();
+
+            return copy;
+        }
+
+        function syncQueueSnapshot(remote) {
+            var local = {};
+            var seen = syncRemoteSeen || {};
+            var tables = ['episode_progress', 'movie_watched_marks', 'series_torrent_resume'];
+            var table;
+            var i;
+
+            for (i = 0; i < tables.length; i++) seen[tables[i]] = seen[tables[i]] || {};
+
+            try {
+                var timeline = L().Timeline;
+                var filename = timeline && typeof timeline.filename === 'function' ? timeline.filename() : 'file_view';
+                var viewed = L().Storage.get(filename, {});
+
+                if (typeof viewed === 'string') viewed = JSON.parse(viewed || '{}');
+                if (viewed && typeof viewed === 'object') {
+                    for (var hashValue in viewed) {
+                        if (!Object.prototype.hasOwnProperty.call(viewed, hashValue)) continue;
+                        var road = viewed[hashValue];
+                        if (typeof road === 'number') road = { percent: road };
+                        if (!road || typeof road !== 'object') continue;
+
+                        var timelineRow = syncPrepareRow('episode_progress', {
+                            timeline_hash: String(hashValue), percent: parseFloat(road.percent) || 0,
+                            time: parseFloat(road.time) || 0, duration: parseFloat(road.duration) || 0,
+                            profile: typeof road.profile === 'undefined' ? 0 : road.profile,
+                            card: road.card || null, season: typeof road.season === 'undefined' ? null : road.season,
+                            episode: typeof road.episode === 'undefined' ? null : road.episode,
+                            updated_at: syncIso(road.updated || 0)
+                        });
+                        local.episode_progress = local.episode_progress || [];
+                        local.episode_progress.push(timelineRow);
+                    }
+                }
+            } catch (e) {
+                log('sync timeline snapshot error', e && e.message);
+            }
+
+            var marks = loadMovieMarks();
+
+            for (var movieKeyValue in marks) {
+                if (!Object.prototype.hasOwnProperty.call(marks, movieKeyValue)) continue;
+                var movieMatch = /^([\w-]+)_(.+)$/.exec(movieKeyValue);
+                if (!movieMatch) continue;
+                var movieRow = syncPrepareRow('movie_watched_marks', {
+                    source: movieMatch[1], movie_id: movieMatch[2], title: marks[movieKeyValue].title || '',
+                    marked_at: marks[movieKeyValue].t || 0, updated_at: syncIso(marks[movieKeyValue].t || 0), is_deleted: false
+                });
+                local.movie_watched_marks = local.movie_watched_marks || [];
+                local.movie_watched_marks.push(movieRow);
+            }
+
+            var torrents = loadTorrents();
+
+            for (var torrentKey in torrents) {
+                if (!Object.prototype.hasOwnProperty.call(torrents, torrentKey)) continue;
+                var torrentMatch = /^([\w-]+)_(.+)$/.exec(torrentKey);
+                var torrent = torrents[torrentKey];
+                if (!torrentMatch || !torrent.magnet) continue;
+                var torrentRow = syncPrepareRow('series_torrent_resume', {
+                    source: torrentMatch[1], series_id: torrentMatch[2], title: torrent.title || '',
+                    magnet: torrent.magnet, season_number: toInt(torrent.season), episode_number: toInt(torrent.episode),
+                    updated_at: syncIso(torrent.t || 0)
+                });
+                local.series_torrent_resume = local.series_torrent_resume || [];
+                local.series_torrent_resume.push(torrentRow);
+            }
+
+            for (i = 0; i < tables.length; i++) {
+                table = tables[i];
+                var list = local[table] || [];
+
+                for (var j = 0; j < list.length; j++) {
+                    var row = list[j];
+                    var key = syncQueueKey(table, row);
+                    var localTime = syncTime(row.updated_at);
+                    var serverTime = seen[table][key] || 0;
+
+                    if (!serverTime || localTime > serverTime) syncEnqueue(table, row, localTime);
+                }
+            }
+        }
+
+        function syncApplyRows(table, rows) {
+            if (!isArray(rows) || !rows.length) return;
+
+            var seen = syncRemoteSeen[table];
+            var i;
+            var row;
+            var key;
+            var updated;
+
+            if (table === 'episode_progress') {
+                try {
+                    var timeline = L().Timeline;
+                    var filename = timeline && typeof timeline.filename === 'function' ? timeline.filename() : 'file_view';
+                    var viewed = L().Storage.get(filename, {});
+                    if (typeof viewed === 'string') viewed = JSON.parse(viewed || '{}');
+                    if (!viewed || typeof viewed !== 'object') viewed = {};
+
+                    var changed = false;
+                    for (i = 0; i < rows.length; i++) {
+                        row = rows[i] || {};
+                        if (!row.timeline_hash) continue;
+                        key = syncQueueKey(table, row);
+                        updated = syncTime(row.updated_at);
+                        seen[key] = Math.max(seen[key] || 0, updated);
+                        var current = viewed[row.timeline_hash];
+                        var currentTime = current && typeof current === 'object' ? syncTime(current.updated) : 0;
+
+                        if (current && currentTime >= updated) continue;
+                        viewed[row.timeline_hash] = {
+                            percent: row.percent || 0, time: row.time || 0, duration: row.duration || 0,
+                            profile: row.profile || 0, updated: updated,
+                            card: row.card || undefined, season: row.season, episode: row.episode
+                        };
+                        changed = true;
+                    }
+
+                    if (changed) {
+                        syncApplying = true;
+                        L().Storage.set(filename, viewed);
+                        timeline.read();
+                        syncApplying = false;
+                    }
+                } catch (e) {
+                    syncApplying = false;
+                    log('sync timeline restore error', e && e.message);
+                }
+            } else if (table === 'movie_watched_marks') {
+                var marks = loadMovieMarks();
+                var movieChanged = false;
+
+                for (i = 0; i < rows.length; i++) {
+                    row = rows[i] || {};
+                    if (!row.source || !row.movie_id) continue;
+                    key = syncQueueKey(table, row);
+                    updated = syncTime(row.updated_at);
+                    seen[key] = Math.max(seen[key] || 0, updated);
+                    var movieKeyValue = row.source + '_' + row.movie_id;
+                    var currentMark = marks[movieKeyValue];
+                    var currentMarkTime = currentMark ? syncTime(currentMark.t) : 0;
+                    if (currentMarkTime >= updated) continue;
+
+                    if (row.is_deleted) delete marks[movieKeyValue];
+                    else marks[movieKeyValue] = { t: updated, title: row.title || '' };
+                    movieChanged = true;
+                }
+
+                if (movieChanged) {
+                    saveMovieMarks();
+                    updateBadges();
+                }
+            } else if (table === 'series_torrent_resume') {
+                var torrentItems = loadTorrents();
+                var torrentsChanged = false;
+
+                for (i = 0; i < rows.length; i++) {
+                    row = rows[i] || {};
+                    if (!row.source || !row.series_id || !row.magnet) continue;
+                    key = syncQueueKey(table, row);
+                    updated = syncTime(row.updated_at);
+                    seen[key] = Math.max(seen[key] || 0, updated);
+                    var torrentKeyValue = row.source + '_' + row.series_id;
+                    var currentTorrent = torrentItems[torrentKeyValue];
+                    if (currentTorrent && syncTime(currentTorrent.t) >= updated) continue;
+
+                    torrentItems[torrentKeyValue] = {
+                        title: row.title || '', magnet: row.magnet, link: '', hash: '',
+                        season: toInt(row.season_number), episode: toInt(row.episode_number), t: updated
+                    };
+                    torrentsChanged = true;
+                }
+
+                if (torrentsChanged) saveTorrents();
+            }
+        }
+
+        function syncAck(batch) {
+            var items = syncLoadQueue();
+            var sent = {};
+            var kept = [];
+
+            for (var i = 0; i < batch.length; i++) sent[batch[i].id] = true;
+            for (i = 0; i < items.length; i++) if (!sent[items[i].id]) kept.push(items[i]);
+
+            syncQueue = kept;
+            syncSaveQueue();
+        }
+
+        function syncBatch() {
+            var items = syncLoadQueue();
+            var batch = items.slice(0, SYNC_BATCH);
+            var changes = { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] };
+
+            for (var i = 0; i < batch.length; i++) changes[batch[i].table].push(batch[i].row);
+
+            return { items: batch, changes: changes };
+        }
+
+        function syncPushPending(callback) {
+            var batch = syncBatch();
+
+            if (!batch.items.length) return callback();
+
+            syncRequest(syncEndpoint(), syncCode(), {
+                action: 'push', sync_id: syncNamespace(), profile_id: syncProfile(), changes: batch.changes
+            }, function (err, response) {
+                if (err || !response || response.success !== true) {
+                    syncLastError = err || 'sync_rejected';
+                    return callback(syncLastError);
+                }
+
+                syncAck(batch.items);
+                timers.set(function () { syncPushPending(callback); }, 0);
+            });
+        }
+
+        function syncPullPage(cursor, callback, legacyOffset) {
+            if (typeof legacyOffset !== 'number') legacyOffset = 0;
+            var batch = !cursor || !cursor.__pushed ? syncBatch() : { items: [], changes: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } };
+            var body = {
+                action: 'sync', sync_id: syncNamespace(), profile_id: syncProfile(),
+                offset: legacyOffset || 0, cursor: cursor || {}, limit: SYNC_PAGE, changes: batch.changes
+            };
+
+            if (cursor && cursor.__pushed) delete cursor.__pushed;
+
+            syncRequest(syncEndpoint(), syncCode(), body, function (err, response) {
+                if (err || !response || response.success !== true) {
+                    syncLastError = err || 'sync_rejected';
+                    return callback(syncLastError);
+                }
+
+                if (batch.items.length) syncAck(batch.items);
+                var data = response.data || {};
+                syncApplyRows('episode_progress', data.episode_progress || []);
+                syncApplyRows('movie_watched_marks', data.movie_watched_marks || []);
+                syncApplyRows('series_torrent_resume', data.series_torrent_resume || []);
+
+                var next = response.next;
+                if (next && (next.episode_progress || next.movie_watched_marks || next.series_torrent_resume)) {
+                    next.__pushed = true;
+                    return timers.set(function () { syncPullPage(next, callback, legacyOffset); }, 0);
+                }
+
+                var more = response.more || {};
+                if (!response.next && (more.episode_progress || more.movie_watched_marks || more.series_torrent_resume)) {
+                    return timers.set(function () { syncPullPage({ __pushed: true }, callback, legacyOffset + SYNC_PAGE); }, 0);
+                }
+
+                syncQueueSnapshot();
+                syncPushPending(callback);
+            });
+        }
+
+        function syncNow() {
+            if (syncBusy || !syncEndpoint() || !syncCode()) return false;
+
+            syncBusy = true;
+            syncRemoteSeen = { episode_progress: {}, movie_watched_marks: {}, series_torrent_resume: {} };
+            syncPullPage({}, function (err) {
+                syncBusy = false;
+                syncLastError = err || '';
+
+                if (!err) {
+                    syncLastSuccess = clock();
+                    log('sync complete', 'queued:', syncLoadQueue().length);
+                } else {
+                    log('sync error', err);
+                    timers.set(function () { syncNow(); }, Math.min(SYNC_INTERVAL, 15000));
+                }
+            });
+
+            return true;
+        }
+
+        function syncStart() {
+            if (syncStarted) return;
+
+            syncStarted = true;
+            timers.set(syncNow, 6000);
+            timers.interval(syncNow, SYNC_INTERVAL);
+
+            try {
+                if (win.addEventListener) win.addEventListener('online', syncNow, false);
+            } catch (e) {}
         }
 
         function loadCache() {
@@ -1486,6 +1974,15 @@
 
             log('movie', key, card.title || card.original_title, '→', watched ? 'watched' : 'unmarked');
 
+            var match = /^([\w-]+)_(.+)$/.exec(key);
+            if (match) {
+                var stamp = clock();
+                syncEnqueue('movie_watched_marks', syncPrepareRow('movie_watched_marks', {
+                    source: match[1], movie_id: match[2], title: watched ? (card.title || card.original_title) : (before && before.title || ''),
+                    marked_at: watched ? stamp : null, updated_at: syncIso(stamp), is_deleted: !watched
+                }), stamp);
+            }
+
             updateBadges();
 
             return Boolean(watched);
@@ -1532,7 +2029,9 @@
             var badge = doc().createElement('div');
 
             badge.className = BADGE_CLASS;
-            badge.innerHTML = CHECK_ICON + '<span>' + BADGE_TEXT + '</span>';
+            badge.setAttribute('aria-label', BADGE_TEXT);
+            badge.title = BADGE_TEXT;
+            badge.innerHTML = CHECK_ICON + '<span class="hws-watched-badge__label">' + BADGE_TEXT + '</span>';
 
             return badge;
         }
@@ -1572,15 +2071,13 @@
             if (!show) return;
 
             // Значки закладок Lampa (.card__icons) стоят вверху по центру: при них плашка опускается под них
-            var inner = el.querySelector('.card__icons-inner');
-            var low = Boolean(inner && inner.children && inner.children.length);
             var badge = null;
 
             for (var i = 0; i < view.childNodes.length && !badge; i++) {
                 if (hasClass(view.childNodes[i], BADGE_CLASS)) badge = view.childNodes[i];
             }
 
-            var className = BADGE_CLASS + (low ? ' ' + BADGE_CLASS + '--low' : '');
+            var className = BADGE_CLASS;
 
             if (badge && badge.className !== className) badge.className = className;
         }
@@ -1669,14 +2166,12 @@
 
             style.id = 'hws-style';
             style.textContent = [
-                // Правый верхний угол постера: внизу справа рейтинг .card__vote, слева сверху метка типа
-                '.' + BADGE_CLASS + '{position:absolute;top:.5em;right:.5em;z-index:2;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;',
-                'padding:.3em .6em .3em .45em;-webkit-border-radius:1em;border-radius:1em;background:#1f9d5c;background:-webkit-linear-gradient(top,#2ec27a,#178a4e);background:linear-gradient(to bottom,#2ec27a,#178a4e);',
-                'color:#fff;font-size:.8em;font-weight:600;line-height:1.2;white-space:nowrap;-webkit-box-shadow:0 .15em .6em rgba(0,0,0,.4);box-shadow:0 .15em .6em rgba(0,0,0,.4);pointer-events:none}',
-                '.' + BADGE_CLASS + ' svg{width:1.05em;height:1.05em;margin-right:.35em;-webkit-flex-shrink:0;flex-shrink:0}',
-                // .card__icons: top .9em + значок ~1.8em (в em карточки) → ниже на ~3.9em шрифта плашки
-                '.' + BADGE_CLASS + '--low{top:3.9em}',
-                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.8em;right:.8em;font-size:1em}',
+                // Маленькая зелёная галочка в углу не перекрывает содержимое постера
+                '.' + BADGE_CLASS + '{position:absolute;top:.35em;right:.35em;z-index:3;width:1.25em;height:1.25em;display:-webkit-box;display:-webkit-flex;display:flex;-webkit-box-align:center;-webkit-align-items:center;align-items:center;-webkit-box-pack:center;-webkit-justify-content:center;justify-content:center;',
+                '-webkit-border-radius:50%;border-radius:50%;background:rgba(0,0,0,.72);color:#2ec27a;line-height:1;pointer-events:none}',
+                '.' + BADGE_CLASS + ' svg{width:.9em;height:.9em;display:block}',
+                '.' + BADGE_CLASS + '__label{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}',
+                '.full-start-new__poster .' + BADGE_CLASS + ',.full-start__poster .' + BADGE_CLASS + '{top:.55em;right:.55em;font-size:1.1em}',
                 '.button--hws-movie.hws-movie--on svg{color:#2ec27a}'
             ].join('');
 
@@ -1823,7 +2318,7 @@
                     for (var key in parsed.items) {
                         var rec = parsed.items[key];
 
-                        if (Object.prototype.hasOwnProperty.call(parsed.items, key) && rec && typeof rec === 'object' && (rec.link || rec.hash)) torrentRecords[key] = rec;
+                        if (Object.prototype.hasOwnProperty.call(parsed.items, key) && rec && typeof rec === 'object' && (rec.link || rec.hash || rec.magnet)) torrentRecords[key] = rec;
                     }
                 }
             } catch (e) {
@@ -1951,6 +2446,14 @@
 
             items[key] = record;
             saveTorrents();
+
+            var keyParts = /^([\w-]+)_(.+)$/.exec(key);
+            if (keyParts && record.magnet) {
+                syncEnqueue('series_torrent_resume', syncPrepareRow('series_torrent_resume', {
+                    source: keyParts[1], series_id: keyParts[2], title: record.title || '', magnet: record.magnet,
+                    season_number: record.season, episode_number: record.episode, updated_at: syncIso(record.t)
+                }), record.t);
+            }
 
             log('torrent remembered', key, 's' + record.season + 'e' + record.episode, record.magnet ? 'magnet' : record.link ? 'link' : 'hash only');
         }
@@ -2321,6 +2824,36 @@
 
                 api.addParam({
                     component: component,
+                    param: { name: SETTINGS.syncUrl, type: 'input', placeholder: 'https://<project>.supabase.co', 'default': '' },
+                    field: { name: 'Supabase: адрес проекта или swift-task URL', description: 'URL функции формата https://<project>.supabase.co/functions/v1/swift-task' },
+                    onChange: function () { scheduleSync(1000); }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: SETTINGS.syncCode, type: 'input', placeholder: 'x-sync-code', 'default': '' },
+                    field: { name: 'Supabase: код синхронизации', description: 'Значение заголовка x-sync-code; сохраняется только в хранилище Lampa на этом устройстве' },
+                    onChange: function () { scheduleSync(1000); }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: SETTINGS.syncId, type: 'input', placeholder: 'default', 'default': 'default' },
+                    field: { name: 'Группа синхронизации', description: 'Одинаковое значение на устройствах, историю которых нужно объединить' },
+                    onChange: function () { scheduleSync(1000); }
+                });
+
+                api.addParam({
+                    component: component,
+                    param: { name: 'hws_sync_now', type: 'button' },
+                    field: { name: 'Синхронизировать сейчас', description: 'Отправить очередь и получить актуальную историю' },
+                    onChange: function () {
+                        if (!syncNow()) notify('Укажите адрес Supabase и код синхронизации');
+                    }
+                });
+
+                api.addParam({
+                    component: component,
                     param: { name: 'hws_clear_cache', type: 'button' },
                     field: { name: 'Очистить данные плагина', description: 'Удалить сохранённые результаты проверок' },
                     onChange: function () {
@@ -2340,7 +2873,28 @@
 
         /* ---------- запуск ---------- */
 
-        function onTimelineUpdate() {
+        function onTimelineUpdate(e) {
+            if (!syncApplying) {
+                try {
+                    var data = e && e.data || {};
+                    var road = data.road || {};
+
+                    if (data.hash !== null && typeof data.hash !== 'undefined') {
+                        var timelineRow = syncPrepareRow('episode_progress', {
+                            timeline_hash: String(data.hash), percent: parseFloat(road.percent) || 0,
+                            time: parseFloat(road.time) || 0, duration: parseFloat(road.duration) || 0,
+                            profile: typeof road.profile === 'undefined' ? 0 : road.profile,
+                            card: road.card || null, season: typeof road.season === 'undefined' ? null : road.season,
+                            episode: typeof road.episode === 'undefined' ? null : road.episode,
+                            updated_at: syncIso(road.updated || clock())
+                        });
+                        syncEnqueue('episode_progress', timelineRow, road.updated || clock());
+                    }
+                } catch (syncError) {
+                    log('sync timeline queue error', syncError && syncError.message);
+                }
+            }
+
             var items = loadCache();
 
             for (var id in items) {
@@ -2374,6 +2928,7 @@
                 } catch (e) {}
 
                 startBadges();
+                syncStart();
 
                 try {
                     patchTorrentStart();
@@ -2442,6 +2997,10 @@
                         if (ls) ls.removeItem(SETTINGS[key]);
                     } catch (e) {}
                 }
+
+                try {
+                    if (ls) ls.removeItem(SYNC_QUEUE_KEY);
+                } catch (e) {}
             },
             filterList: filterList,
             hideCard: hideCard,
@@ -2455,6 +3014,11 @@
             scanBadges: scanBadges,
             torrentRecord: torrentRecord,
             continueTorrent: continueTorrent,
+            syncNow: syncNow,
+            syncStatus: function () {
+                return { enabled: Boolean(syncEndpoint() && syncCode()), queued: syncLoadQueue().length, busy: syncBusy, lastError: syncLastError, lastSuccess: syncLastSuccess };
+            },
+            syncQueue: function () { return syncLoadQueue(); },
             cache: function () {
                 return loadCache();
             },

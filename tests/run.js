@@ -293,7 +293,7 @@ check('12b', 'Исходные объекты карточек в истории
 });
 
 /* ---------------- 13. Повторная загрузка плагина ---------------- */
-check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 5, true], () => {
+check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 9, true], () => {
     const env = createEnv();
     const api1 = env.install();
     const api2 = env.install();
@@ -978,6 +978,109 @@ function checkAsync(id, title, expected, fn) {
     asyncChecks.push({ id, title, expected, fn });
 }
 
+checkAsync('S1', 'Синхронизация сохраняет обычный Timeline update в офлайн-очередь', [1, 'episode_progress', 'ep-offline'], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    env.install({ syncRequest: () => {} });
+    env.Lampa.Timeline.listener.send('update', { data: { hash: 'ep-offline', road: { percent: 42, time: 420, duration: 1000, updated: 1000 } } });
+    const queue = env.win.HideWatchedSeries.syncQueue();
+
+    return [queue.length, queue[0].table, queue[0].row.timeline_hash];
+});
+
+checkAsync('S2', 'Pull восстанавливает Timeline, отметку фильма и торрент без link', [88, true, 'magnet:?xt=one', '', 'test-code'], async () => {
+    const now = 1800000000000;
+    const env = createEnv({ version: '3.x', now, settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    let auth = '';
+    env.install({ syncRequest: (url, code, body, done) => {
+        auth = code;
+        done(null, body.action === 'sync' ? {
+            success: true,
+            data: {
+                episode_progress: [{ profile_id: '0', timeline_hash: 'remote-ep', percent: 88, time: 880, duration: 1000, profile: 0, card: 'tv_1', season: 1, episode: 4, updated_at: new Date(now).toISOString() }],
+                movie_watched_marks: [{ profile_id: '0', source: 'tmdb', movie_id: '27205', title: 'Inception', marked_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString(), is_deleted: false }],
+                series_torrent_resume: [{ profile_id: '0', source: 'tmdb', series_id: '247718', title: 'Show', magnet: 'magnet:?xt=one', season_number: 1, episode_number: 4, updated_at: new Date(now).toISOString() }]
+            },
+            more: { episode_progress: false, movie_watched_marks: false, series_torrent_resume: false }
+        } : { success: true });
+    } });
+    env.win.HideWatchedSeries.syncNow();
+    const timeline = JSON.parse(env.ls.getItem('file_view'));
+
+    return [timeline['remote-ep'].percent, env.win.HideWatchedSeries.isMovieWatched(movie()), env.win.HideWatchedSeries.torrentRecord(series()).magnet, env.win.HideWatchedSeries.torrentRecord(series()).link, auth];
+});
+
+checkAsync('S3', 'Более свежая локальная запись побеждает старую серверную', [91, 91, 'ep'], async () => {
+    const now = 1900000000000;
+    const ls = memoryStorage({ file_view: JSON.stringify({ ep: { percent: 91, time: 910, duration: 1000, profile: 0, updated: now } }) });
+    const env = createEnv({ version: '3.x', now, localStorage: ls, settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    let pushed = null;
+    env.install({ syncRequest: (url, code, body, done) => {
+        if (body.action === 'push') pushed = body.changes.episode_progress[0];
+        done(null, body.action === 'sync' ? {
+            success: true,
+            data: { episode_progress: [{ profile_id: '0', timeline_hash: 'ep', percent: 20, time: 200, duration: 1000, updated_at: new Date(now - 1000).toISOString() }], movie_watched_marks: [], series_torrent_resume: [] },
+            more: { episode_progress: false, movie_watched_marks: false, series_torrent_resume: false }
+        } : { success: true });
+    } });
+    env.win.HideWatchedSeries.syncNow();
+
+    return [JSON.parse(ls.getItem('file_view')).ep.percent, pushed && pushed.percent, pushed && pushed.timeline_hash];
+});
+
+checkAsync('S4', 'BIGINT marked_at отправляется числом миллисекунд', [true, true], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    env.install({ syncRequest: () => {} });
+    env.win.HideWatchedSeries.setMovieWatched(movie(), true);
+    const row = env.win.HideWatchedSeries.syncQueue().filter((item) => item.table === 'movie_watched_marks')[0].row;
+
+    return [typeof row.marked_at === 'number', row.marked_at === JSON.parse(env.ls.getItem('hws_movies_watched')).items.tmdb_27205.t];
+});
+
+checkAsync('S5', 'Клиент проходит все keyset-страницы до завершения pull', [2, 33, 77], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    let pages = 0;
+    env.install({ syncRequest: (url, code, body, done) => {
+        if (body.action === 'push') return done(null, { success: true });
+        pages++;
+        const second = Boolean(body.cursor && body.cursor.episode_progress);
+        const now = second ? 1800000000001 : 1800000000000;
+        done(null, {
+            success: true,
+            data: {
+                episode_progress: [{ profile_id: '0', timeline_hash: second ? 'page-two' : 'page-one', percent: second ? 77 : 33, updated_at: new Date(now).toISOString() }],
+                movie_watched_marks: [], series_torrent_resume: []
+            },
+            more: { episode_progress: !second, movie_watched_marks: false, series_torrent_resume: false },
+            next: second ? { episode_progress: null, movie_watched_marks: null, series_torrent_resume: null } : {
+                episode_progress: { updated_at: new Date(now).toISOString(), timeline_hash: 'page-one' },
+                movie_watched_marks: null, series_torrent_resume: null
+            }
+        });
+    } });
+    env.win.HideWatchedSeries.syncNow();
+    env.flush();
+    const timeline = JSON.parse(env.ls.getItem('file_view'));
+
+    return [pages, timeline['page-one'].percent, timeline['page-two'].percent];
+});
+
+checkAsync('S6', 'Fallback пагинации поддерживает старый ответ more/offset', [0, 300], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    const offsets = [];
+    env.install({ syncRequest: (url, code, body, done) => {
+        if (body.action === 'push') return done(null, { success: true });
+        offsets.push(body.offset);
+        done(null, {
+            success: true, data: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] },
+            more: { episode_progress: offsets.length === 1, movie_watched_marks: false, series_torrent_resume: false }
+        });
+    } });
+    env.win.HideWatchedSeries.syncNow();
+    env.flush();
+
+    return offsets;
+});
+
 const MOVIE = { id: 27205, source: 'tmdb', title: 'Начало', original_title: 'Inception', release_date: '2010-07-15', vote_average: 8.4 };
 const movie = (extra) => Object.assign({}, MOVIE, extra || {});
 
@@ -1206,7 +1309,7 @@ checkAsync('F12', 'Нет бесконечного цикла: вставка с
     return [env.badges(), env.pending.length];
 });
 
-checkAsync('F13', 'Стиль: плашка в правом верхнем углу постера (и у широких карточек), внутри .card__view', [1, true, true], async () => {
+checkAsync('F13', 'Стиль: маленькая галочка в правом верхнем углу, внутри .card__view', [1, true, true], async () => {
     const env = await domEnv();
 
     env.win.HideWatchedSeries.setMovieWatched(movie(), true);
@@ -1216,10 +1319,10 @@ checkAsync('F13', 'Стиль: плашка в правом верхнем уг�
     const css = env.document.getElementById('hws-style').textContent;
     const badge = env.document.querySelector('.hws-watched-badge');
 
-    return [env.badges(), /\.hws-watched-badge\{position:absolute;top:\.5em;right:\.5em;/.test(css) && css.indexOf('bottom:') === -1, badge.parentNode.className === 'card__view'];
+    return [env.badges(), /\.hws-watched-badge\{position:absolute;top:\.35em;right:\.35em;/.test(css) && css.indexOf('width:1.25em') !== -1 && css.indexOf('bottom:') === -1, badge.parentNode.className === 'card__view'];
 });
 
-checkAsync('F14', 'Значки закладок вверху: плашка опускается под них, без значков — в самом углу; следит за изменениями', [false, true, false, 1], async () => {
+checkAsync('F14', 'Маленькая галочка остаётся в углу с закладками и без них', [false, false, false, 1], async () => {
     const env = await domEnv();
     const el = env.makeCard(movie());
     const badge = () => el.querySelector('.hws-watched-badge');

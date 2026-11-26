@@ -274,6 +274,13 @@ function createEnv(opts) {
     // Timeline 2.3.0: view(hash) и update(params); в 3.x ещё link() и поиск по привязке
     const Timeline = {
         listener: subscribe(),
+        filename() { return 'file_view'; },
+        read() {
+            const raw = ls.getItem('file_view');
+            const parsed = raw ? JSON.parse(raw) : {};
+            Object.keys(timeline).forEach((key) => delete timeline[key]);
+            Object.keys(parsed).forEach((key) => { timeline[key] = parsed[key]; });
+        },
         view(hash, meta) {
             let v = timeline[hash];
 
@@ -304,6 +311,8 @@ function createEnv(opts) {
             }
 
             timeline[params.hash] = road;
+            road.updated = params.updated || env.now();
+            ls.setItem('file_view', JSON.stringify(timeline));
             Timeline.listener.send('update', { data: { hash: params.hash, road } });
         }
     };
@@ -374,6 +383,13 @@ function createEnv(opts) {
             get(name, empty) {
                 let v = Object.prototype.hasOwnProperty.call(settings, name) ? settings[name] : undefined;
 
+                if (typeof v === 'undefined') {
+                    const raw = ls.getItem(name);
+                    if (raw !== null) {
+                        try { v = JSON.parse(raw); } catch (e) { v = raw; }
+                    }
+                }
+
                 v = v || empty || '';
 
                 if (v === 'true' || v === 'false') return v === 'true';
@@ -383,7 +399,7 @@ function createEnv(opts) {
             },
             set(name, value) {
                 settings[name] = value;
-                ls.setItem(name, typeof value === 'object' ? JSON.stringify(value) : String(value));
+                ls.setItem(name, value && typeof value === 'object' ? JSON.stringify(value) : String(value));
             },
             field(name) {
                 return name === 'tmdb_lang' ? 'ru' : '';

@@ -5,7 +5,7 @@
   "description": "Плагин Lampa: убирает досмотренные сериалы из «Продолжить просмотр» до выхода новой серии",
   "main": "hide_watched_series.js",
   "scripts": {
-    "test": "node tests/run.js && node tests/check_es5.js",
+    "test": "node tests/run.js && node tests/check_es5.js && node --experimental-strip-types --test tests/supabase_sync.test.mjs",
     "serve": "node tests/integration/serve.js"
   },
   "devDependencies": {

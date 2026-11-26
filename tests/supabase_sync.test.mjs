@@ -4,16 +4,17 @@ import { readFile } from 'node:fs/promises';
 
 const calls = [];
 let handler;
+let databaseFailure = '';
+
+const environment = {
+    LAMPA_SYNC_CODE: 'test-sync-code',
+    SUPABASE_URL: 'https://db.example.test',
+    SUPABASE_SECRET_KEYS: JSON.stringify({ default: 'unit-test-service-key' })
+};
 
 globalThis.Deno = {
     env: {
-        get(name) {
-            return {
-                LAMPA_SYNC_CODE: 'test-sync-code',
-                SUPABASE_URL: 'https://db.example.test',
-                SUPABASE_SECRET_KEYS: JSON.stringify({ default: 'unit-test-service-key' })
-            }[name] || '';
-        }
+        get(name) { return environment[name] || ''; }
     },
     serve(fn) { handler = fn; }
 };
@@ -23,6 +24,14 @@ globalThis.fetch = async (input, init = {}) => {
     const headers = new Headers(init.headers || {});
     calls.push({ url, init, headers });
 
+    if (databaseFailure === 'write' && url.pathname.endsWith('/rpc/hws_sync_apply')) {
+        databaseFailure = '';
+        return new Response('write failed', { status: 500 });
+    }
+    if (databaseFailure === 'read' && !url.pathname.endsWith('/rpc/hws_sync_apply')) {
+        databaseFailure = '';
+        return new Response('read failed', { status: 500 });
+    }
     if (url.pathname.endsWith('/rpc/hws_sync_apply')) return new Response(null, { status: 204 });
 
     const table = url.pathname.split('/').pop();
@@ -63,6 +72,69 @@ test('rejects wrong x-sync-code without contacting PostgREST', async () => {
     const response = await handler(request({ action: 'sync' }, 'wrong'));
     assert.equal(response.status, 401);
     assert.equal(calls.length, 0);
+});
+
+test('OPTIONS preflight returns a bodyless 204 with CORS headers', async () => {
+    const response = await handler(new Request('https://function.example.test', { method: 'OPTIONS' }));
+    assert.equal(response.status, 204);
+    assert.equal(await response.text(), '');
+    assert.equal(response.headers.get('Access-Control-Allow-Origin'), '*');
+    assert.match(response.headers.get('Access-Control-Allow-Headers'), /x-sync-code/);
+});
+
+test('HTTP validation failures and health response use body-capable statuses', async () => {
+    const get = await handler(new Request('https://function.example.test', { method: 'GET' }));
+    assert.equal(get.status, 405);
+    assert.deepEqual(await get.json(), { success: false, error: 'method_not_allowed' });
+
+    const malformed = await handler(new Request('https://function.example.test', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-sync-code': 'test-sync-code' }, body: '{'
+    }));
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await malformed.json(), { success: false, error: 'invalid_json' });
+
+    const health = await handler(request({ action: 'health' }));
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { success: true });
+});
+
+test('rejects unsupported actions and invalid scopes with JSON errors', async () => {
+    const action = await handler(request({ action: 'delete' }));
+    assert.equal(action.status, 400);
+    assert.deepEqual(await action.json(), { success: false, error: 'unknown_action' });
+
+    const scope = await handler(request({ action: 'sync', sync_id: '', profile_id: '0' }));
+    assert.equal(scope.status, 400);
+    assert.deepEqual(await scope.json(), { success: false, error: 'invalid_scope' });
+});
+
+test('reports missing server configuration without calling PostgREST', async () => {
+    calls.length = 0;
+    const previous = environment.SUPABASE_URL;
+    environment.SUPABASE_URL = '';
+    try {
+        const response = await handler(request({ action: 'sync', sync_id: 'house', profile_id: '0' }));
+        assert.equal(response.status, 500);
+        assert.deepEqual(await response.json(), { success: false, error: 'supabase_secrets_missing' });
+        assert.equal(calls.length, 0);
+    } finally {
+        environment.SUPABASE_URL = previous;
+    }
+});
+
+test('maps PostgREST write and read failures to JSON 502 responses', async () => {
+    databaseFailure = 'write';
+    const write = await handler(request({
+        action: 'push', sync_id: 'house', profile_id: '0',
+        changes: { episode_progress: [{ timeline_hash: 'ep', percent: 50 }] }
+    }));
+    assert.equal(write.status, 502);
+    assert.deepEqual(await write.json(), { success: false, error: 'database_write_failed', table: 'episode_progress' });
+
+    databaseFailure = 'read';
+    const read = await handler(request({ action: 'sync', sync_id: 'house', profile_id: '0' }));
+    assert.equal(read.status, 502);
+    assert.deepEqual(await read.json(), { success: false, error: 'database_read_failed', table: 'episode_progress' });
 });
 
 test('uses SUPABASE_SECRET_KEYS.default and returns old/new compatible rows with pagination', async () => {

@@ -172,7 +172,7 @@ async function restFetch(url: string, key: string, init: RequestInit = {}): Prom
 }
 
 Deno.serve(async (request: Request) => {
-    if (request.method === "OPTIONS") return new Response("", { status: 204, headers: corsHeaders });
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
     if (request.method !== "POST") return json({ success: false, error: "method_not_allowed" }, 405);
 
     const expected = Deno.env.get("LAMPA_SYNC_CODE") || "";

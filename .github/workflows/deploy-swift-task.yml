@@ -39,4 +39,4 @@ jobs:
           test -n "$SUPABASE_PROJECT_REF" || { echo "Missing SUPABASE_PROJECT_REF secret"; exit 1; }
 
       - name: Deploy swift-task
-        run: supabase functions deploy swift-task --remote "$SUPABASE_PROJECT_REF" --use-api --yes
+        run: supabase functions deploy --remote="$SUPABASE_PROJECT_REF" swift-task --use-api --yes

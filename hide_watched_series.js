@@ -2855,21 +2855,21 @@
 
                 api.addParam({
                     component: component,
-                    param: { name: SETTINGS.syncUrl, type: 'input', placeholder: 'https://<project>.supabase.co', 'default': '' },
+                    param: { name: SETTINGS.syncUrl, type: 'input', values: {}, placeholder: 'https://<project>.supabase.co', 'default': '' },
                     field: { name: 'Supabase: адрес проекта или swift-task URL', description: 'URL функции формата https://<project>.supabase.co/functions/v1/swift-task' },
                     onChange: function () { scheduleSync(1000); }
                 });
 
                 api.addParam({
                     component: component,
-                    param: { name: SETTINGS.syncCode, type: 'input', placeholder: 'x-sync-code', 'default': '' },
+                    param: { name: SETTINGS.syncCode, type: 'input', values: {}, placeholder: 'x-sync-code', 'default': '' },
                     field: { name: 'Supabase: код синхронизации', description: 'Значение заголовка x-sync-code; сохраняется только в хранилище Lampa на этом устройстве' },
                     onChange: function () { scheduleSync(1000); }
                 });
 
                 api.addParam({
                     component: component,
-                    param: { name: SETTINGS.syncId, type: 'input', placeholder: 'default', 'default': 'default' },
+                    param: { name: SETTINGS.syncId, type: 'input', values: {}, placeholder: 'default', 'default': 'default' },
                     field: { name: 'Группа синхронизации', description: 'Одинаковое значение на устройствах, историю которых нужно объединить' },
                     onChange: function () { scheduleSync(1000); }
                 });

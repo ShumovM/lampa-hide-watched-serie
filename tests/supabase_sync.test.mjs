@@ -11,7 +11,7 @@ globalThis.Deno = {
             return {
                 LAMPA_SYNC_CODE: 'test-sync-code',
                 SUPABASE_URL: 'https://db.example.test',
-                SUPABASE_SECRET_KEYS: JSON.stringify({ default: 'sb_secret_from_default' })
+                SUPABASE_SECRET_KEYS: JSON.stringify({ default: 'unit-test-service-key' })
             }[name] || '';
         }
     },
@@ -29,19 +29,19 @@ globalThis.fetch = async (input, init = {}) => {
     const offset = url.searchParams.has('or') ? 2 : Number(url.searchParams.get('offset'));
     const fixtures = {
         episode_progress: [
-            { hash: 'legacy-ep', road: { percent: 54 }, timeline_hash: 'legacy-ep', percent: 54, time: 540, duration: 1000, updated_at: '2026-01-01T00:00:00Z' },
-            { hash: 'new-ep', road: { percent: 100 }, timeline_hash: 'new-ep', percent: 100, time: 1000, duration: 1000, updated_at: '2026-01-02T00:00:00Z' },
-            { hash: 'later-ep', road: { percent: 70 }, timeline_hash: 'later-ep', percent: 70, time: 700, duration: 1000, updated_at: '2026-01-03T00:00:00Z' }
+            { id: '1', sync_id: 'house', profile_id: '0', hash: 'legacy-ep', road: { percent: 54, time: 540, duration: 1000 }, client_updated_at: '2026-01-01T00:00:00Z', deleted_at: '2026-01-01T00:00:00Z', device_id: 'dev-a', updated_at: '2026-01-01T00:00:01Z', sync_updated_at: '2026-01-01T00:00:00Z' },
+            { id: '2', sync_id: 'house', profile_id: '0', hash: 'new-ep', road: { percent: 100, time: 1000, duration: 1000 }, client_updated_at: '2026-01-02T00:00:00Z', deleted_at: null, device_id: 'dev-a', updated_at: '2026-01-02T00:00:01Z', sync_updated_at: '2026-01-02T00:00:00Z' },
+            { id: '3', sync_id: 'house', profile_id: '0', hash: 'later-ep', road: { percent: 70, time: 700, duration: 1000 }, client_updated_at: '2026-01-03T00:00:00Z', deleted_at: null, device_id: 'dev-a', updated_at: '2026-01-03T00:00:01Z', sync_updated_at: '2026-01-03T00:00:00Z' }
         ],
         movie_watched_marks: [
-            { source: 'tmdb', movie_id: '42', marked_at: 1767225600000, updated_at: '2026-01-01T00:00:00Z', is_deleted: true },
-            { source: 'tmdb', movie_id: '43', marked_at: 1767312000000, updated_at: '2026-01-02T00:00:00Z', is_deleted: false },
-            { source: 'tmdb', movie_id: '44', marked_at: 1767398400000, updated_at: '2026-01-03T00:00:00Z', is_deleted: false }
+            { id: '4', sync_id: 'house', profile_id: '0', source: 'tmdb', movie_id: '42', title: 'Tombstone', marked_at: 1767225600000, deleted_at: '2026-01-01T00:00:00Z', device_id: 'dev-a', updated_at: '2026-01-01T00:00:01Z', sync_updated_at: '2026-01-01T00:00:00Z' },
+            { id: '5', sync_id: 'house', profile_id: '0', source: 'tmdb', movie_id: '43', title: 'Movie', marked_at: 1767312000000, deleted_at: null, device_id: 'dev-a', updated_at: '2026-01-02T00:00:01Z', sync_updated_at: '2026-01-02T00:00:00Z' },
+            { id: '6', sync_id: 'house', profile_id: '0', source: 'tmdb', movie_id: '44', title: 'Later movie', marked_at: 1767398400000, deleted_at: null, device_id: 'dev-a', updated_at: '2026-01-03T00:00:01Z', sync_updated_at: '2026-01-03T00:00:00Z' }
         ],
         series_torrent_resume: [
-            { source: 'tmdb', series_id: '7', magnet: 'magnet:?xt=one', season_number: 1, episode_number: 2, updated_at: '2026-01-01T00:00:00Z' },
-            { source: 'tmdb', series_id: '8', magnet: 'magnet:?xt=two', season_number: 1, episode_number: 3, updated_at: '2026-01-02T00:00:00Z' },
-            { source: 'tmdb', series_id: '9', magnet: 'magnet:?xt=three', season_number: 2, episode_number: 1, updated_at: '2026-01-03T00:00:00Z' }
+            { id: '7', sync_id: 'house', profile_id: '0', source: 'tmdb', series_id: '7', title: 'Show', magnet: 'magnet:?xt=one', torrent_hash: 'legacy-hash', season_number: 1, episode_number: 2, device_id: 'dev-a', updated_at: '2026-01-01T00:00:01Z', sync_updated_at: '2026-01-01T00:00:00Z' },
+            { id: '8', sync_id: 'house', profile_id: '0', source: 'tmdb', series_id: '8', title: 'Show 2', magnet: 'magnet:?xt=two', torrent_hash: 'legacy-hash-2', season_number: 1, episode_number: 3, device_id: 'dev-a', updated_at: '2026-01-02T00:00:01Z', sync_updated_at: '2026-01-02T00:00:00Z' },
+            { id: '9', sync_id: 'house', profile_id: '0', source: 'tmdb', series_id: '9', title: 'Show 3', magnet: 'magnet:?xt=three', torrent_hash: 'legacy-hash-3', season_number: 2, episode_number: 1, device_id: 'dev-a', updated_at: '2026-01-03T00:00:01Z', sync_updated_at: '2026-01-03T00:00:00Z' }
         ]
     };
     const page = fixtures[table].slice(offset, offset + Number(url.searchParams.get('limit')));
@@ -71,16 +71,19 @@ test('uses SUPABASE_SECRET_KEYS.default and returns old/new compatible rows with
     const firstBody = await first.json();
     assert.equal(firstBody.success, true);
     assert.deepEqual(firstBody.more, { episode_progress: true, movie_watched_marks: true, series_torrent_resume: true });
-    assert.equal(firstBody.data.episode_progress[0].road.percent, 54);
+    assert.equal(firstBody.data.episode_progress[0].percent, 54);
+    assert.equal(firstBody.data.episode_progress[0].timeline_hash, 'legacy-ep');
+    assert.equal(firstBody.data.episode_progress[0].is_deleted, true);
     assert.equal(firstBody.data.movie_watched_marks[0].marked_at, 1767225600000);
     assert.equal(firstBody.data.movie_watched_marks[0].is_deleted, true);
     assert.equal(firstBody.data.series_torrent_resume[0].magnet, 'magnet:?xt=one');
     assert.equal('link' in firstBody.data.series_torrent_resume[0], false);
-    assert.ok(firstBody.next.episode_progress.timeline_hash);
-    assert.ok(calls.every((call) => call.headers.get('apikey') === 'sb_secret_from_default'));
+    assert.equal('torrent_hash' in firstBody.data.series_torrent_resume[0], false);
+    assert.ok(firstBody.next.episode_progress.hash);
+    assert.ok(calls.every((call) => call.headers.get('apikey') === 'unit-test-service-key'));
     const torrentRead = calls.find((call) => call.url.pathname.endsWith('/series_torrent_resume'));
     assert.equal(torrentRead.url.searchParams.get('select').includes('link'), false);
-    assert.equal(torrentRead.url.searchParams.get('select').includes('hash'), false);
+    assert.equal(torrentRead.url.searchParams.get('select').includes('torrent_hash'), false);
 
     const second = await handler(request({ action: 'sync', sync_id: 'house', profile_id: '0', limit: 2, cursor: firstBody.next }));
     const secondBody = await second.json();
@@ -101,19 +104,36 @@ test('push sends all three table batches through the RPC', async () => {
     assert.deepEqual(await response.json(), { success: true });
     const writes = calls.filter((call) => call.url.pathname.endsWith('/rpc/hws_sync_apply'));
     assert.equal(writes.length, 3);
-    assert.ok(writes.every((call) => call.headers.get('apikey') === 'sb_secret_from_default'));
+    const writePayload = JSON.parse(writes[0].init.body);
+    assert.equal(writePayload.p_device_id, 'legacy-client');
+    assert.ok(writes.every((call) => call.headers.get('apikey') === 'unit-test-service-key'));
 });
 
 test('migration preserves legacy required columns and aligns SQL/client wire types', async () => {
     const sql = await readFile(new URL('../supabase/migrations/20261126000000_hws_sync.sql', import.meta.url), 'utf8');
-    assert.match(sql, /hash text not null/i);
-    assert.match(sql, /road jsonb not null/i);
-    assert.match(sql, /insert into public\.episode_progress\s*\(\s*hash, road,/i);
-    assert.match(sql, /marked_at bigint/i);
-    assert.doesNotMatch(sql, /marked_at timestamptz/i);
-    assert.match(sql, /is_deleted boolean/i);
-    assert.match(sql, /where excluded\.updated_at > (episode_progress|movie_watched_marks|series_torrent_resume)\.updated_at/i);
+    assert.match(sql, /hash and road are required legacy columns/i);
+    assert.match(sql, /marked_at' and data_type = 'bigint'/i);
+    assert.match(sql, /column_name = 'client_updated_at'[\s\S]*?data_type = 'bigint'/i);
+    assert.doesNotMatch(sql, /alter column marked_at type/i);
+    assert.match(sql, /deleted_at = excluded\.deleted_at/i);
+    assert.match(sql, /sync_updated_at > movie_watched_marks\.sync_updated_at/i);
+    assert.match(sql, /profile_id, sync_id, hash, road/i);
+    assert.match(sql, /client_updated_at = excluded\.client_updated_at/i);
+    assert.match(sql, /client_updated_at::numeric = 0 then null/i);
     assert.match(sql, /episode_progress_sync_identity/i);
     assert.match(sql, /movie_watched_sync_identity/i);
     assert.match(sql, /series_torrent_sync_identity/i);
+    assert.match(sql, /torrent_hash/i);
+    assert.match(sql, /sync_id text not null default 'default'/i);
+    assert.match(sql, /sync_updated_at timestamptz not null/i);
+    assert.match(sql, /jsonb_strip_nulls\(jsonb_build_object/i);
+    assert.match(sql, /client_updated_at/);
+    assert.match(sql, /elsif id_type = 'bigint' then/i);
+    assert.match(sql, /create sequence if not exists public\.%i as bigint/i);
+    assert.match(sql, /alter column id set default nextval/i);
+    assert.match(sql, /select max\(id\) from public\.%i/i);
+    assert.match(sql, /setval\(%l::regclass, \$1, true\)/i);
+    assert.match(sql, /alter table public\.%i drop constraint/i);
+    assert.doesNotMatch(sql, /^\s*drop\s+table\s+public\./im);
+    assert.doesNotMatch(sql, /delete from public\.(episode_progress|movie_watched_marks|series_torrent_resume)/i);
 });

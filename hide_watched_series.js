@@ -563,6 +563,7 @@
         /* ---------- фоновая синхронизация Supabase ---------- */
 
         var SYNC_QUEUE_KEY = 'hws_sync_queue';
+        var SYNC_DEVICE_KEY = 'hws_sync_device_id';
         var SYNC_QUEUE_VERSION = 1;
         var SYNC_BATCH = 100;
         var SYNC_PAGE = 300;
@@ -600,6 +601,19 @@
             return value ? value.slice(0, 128) : 'default';
         }
 
+        function syncDeviceId() {
+            try {
+                var ls = storage();
+                var id = ls && ls.getItem(SYNC_DEVICE_KEY);
+                if (id) return id;
+                id = 'hws-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+                if (ls) ls.setItem(SYNC_DEVICE_KEY, id);
+                return id;
+            } catch (e) {
+                return 'hws-session-' + clock().toString(36);
+            }
+        }
+
         function syncProfile() {
             try {
                 var account = L().Storage.get('account');
@@ -611,9 +625,9 @@
                 var filename = timeline && typeof timeline.filename === 'function' ? timeline.filename() : '';
                 var match = /file_view_(.+)$/.exec(filename || '');
 
-                return match ? match[1] : '0';
+                return match ? match[1] : 'main';
             } catch (e) {
-                return '0';
+                return 'main';
             }
         }
 
@@ -665,10 +679,11 @@
         }
 
         function syncQueueKey(table, row) {
-            if (table === 'episode_progress') return table + '|' + row.profile_id + '|' + row.timeline_hash;
-            if (table === 'movie_watched_marks') return table + '|' + row.profile_id + '|' + row.source + '|' + row.movie_id;
+            var scope = row.sync_id + '|' + row.profile_id + '|';
+            if (table === 'episode_progress') return table + '|' + scope + row.timeline_hash;
+            if (table === 'movie_watched_marks') return table + '|' + scope + row.source + '|' + row.movie_id;
 
-            return table + '|' + row.profile_id + '|' + row.source + '|' + row.series_id;
+            return table + '|' + scope + row.source + '|' + row.series_id;
         }
 
         function syncEnqueue(table, row, updated) {
@@ -867,6 +882,13 @@
                         var currentTime = current && typeof current === 'object' ? syncTime(current.updated) : 0;
 
                         if (current && currentTime >= updated) continue;
+                        if (row.is_deleted) {
+                            if (current) {
+                                delete viewed[row.timeline_hash];
+                                changed = true;
+                            }
+                            continue;
+                        }
                         viewed[row.timeline_hash] = {
                             percent: row.percent || 0, time: row.time || 0, duration: row.duration || 0,
                             profile: row.profile || 0, updated: updated,
@@ -948,10 +970,19 @@
 
         function syncBatch() {
             var items = syncLoadQueue();
-            var batch = items.slice(0, SYNC_BATCH);
+            var batch = [];
             var changes = { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] };
 
-            for (var i = 0; i < batch.length; i++) changes[batch[i].table].push(batch[i].row);
+            var scope = syncNamespace();
+            var profile = syncProfile();
+
+            for (var i = 0; i < items.length && batch.length < SYNC_BATCH; i++) {
+                var item = items[i];
+                if (!item || !item.row || item.row.sync_id !== scope || String(item.row.profile_id) !== String(profile)) continue;
+                if (!changes[item.table]) continue;
+                batch.push(item);
+                changes[item.table].push(item.row);
+            }
 
             return { items: batch, changes: changes };
         }
@@ -962,7 +993,7 @@
             if (!batch.items.length) return callback();
 
             syncRequest(syncEndpoint(), syncCode(), {
-                action: 'push', sync_id: syncNamespace(), profile_id: syncProfile(), changes: batch.changes
+                action: 'push', sync_id: syncNamespace(), profile_id: syncProfile(), device_id: syncDeviceId(), changes: batch.changes
             }, function (err, response) {
                 if (err || !response || response.success !== true) {
                     syncLastError = err || 'sync_rejected';
@@ -979,7 +1010,7 @@
             var batch = !cursor || !cursor.__pushed ? syncBatch() : { items: [], changes: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } };
             var body = {
                 action: 'sync', sync_id: syncNamespace(), profile_id: syncProfile(),
-                offset: legacyOffset || 0, cursor: cursor || {}, limit: SYNC_PAGE, changes: batch.changes
+                device_id: syncDeviceId(), offset: legacyOffset || 0, cursor: cursor || {}, limit: SYNC_PAGE, changes: batch.changes
             };
 
             if (cursor && cursor.__pushed) delete cursor.__pushed;

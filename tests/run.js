@@ -1081,6 +1081,51 @@ checkAsync('S6', 'Fallback пагинации поддерживает стар�
     return offsets;
 });
 
+checkAsync('S7', 'Pull применяет tombstones Timeline и фильма поверх более старых локальных данных', [false, false, false], async () => {
+    const now = 1950000000000;
+    const localStorage = memoryStorage({
+        file_view: JSON.stringify({ gone: { percent: 80, time: 800, duration: 1000, updated: now - 1000 } }),
+        hws_movies_watched: JSON.stringify({ v: 1, items: { tmdb_27205: { t: now - 1000, title: 'Inception' } } })
+    });
+    const env = createEnv({ version: '3.x', now, localStorage, settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    env.install({ syncRequest: (url, code, body, done) => done(null, body.action === 'sync' ? {
+        success: true,
+        data: {
+            episode_progress: [{ sync_id: 'default', profile_id: '0', timeline_hash: 'gone', is_deleted: true, updated_at: new Date(now).toISOString() }],
+            movie_watched_marks: [{ sync_id: 'default', profile_id: '0', source: 'tmdb', movie_id: '27205', marked_at: now, is_deleted: true, updated_at: new Date(now).toISOString() }],
+            series_torrent_resume: []
+        },
+        more: { episode_progress: false, movie_watched_marks: false, series_torrent_resume: false },
+        next: { episode_progress: null, movie_watched_marks: null, series_torrent_resume: null }
+    } : { success: true }) });
+    env.win.HideWatchedSeries.syncNow();
+
+    return [Boolean(JSON.parse(localStorage.getItem('file_view')).gone), env.win.HideWatchedSeries.isMovieWatched(movie()), env.win.HideWatchedSeries.syncQueue().length > 0];
+});
+
+checkAsync('S8', 'Клиент передаёт стабильный device_id и область sync_id/profile_id', ['family', 'main', true], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code', hws_sync_id: 'family' } });
+    const requests = [];
+    env.install({ syncRequest: (url, code, body, done) => {
+        requests.push(body);
+        done(null, { success: true, data: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] }, more: {}, next: {} });
+    } });
+    env.flush();
+    env.win.HideWatchedSeries.syncNow();
+
+    return [requests[0].sync_id, requests[0].profile_id, Boolean(requests[0].device_id && requests[0].device_id === requests[1].device_id)];
+});
+
+checkAsync('S9', 'В синхронизацию раздачи попадает magnet без link/hash', [true, false, false, false], async () => {
+    const env = createEnv({ version: '3.x', settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'test-code' } });
+    env.install({ syncRequest: () => {} });
+    playFromTorrent(env, series(), 2, 6);
+    const item = env.win.HideWatchedSeries.syncQueue().filter((entry) => entry.table === 'series_torrent_resume')[0];
+    const row = item && item.row || {};
+
+    return [Boolean(row.magnet), Object.prototype.hasOwnProperty.call(row, 'link'), Object.prototype.hasOwnProperty.call(row, 'hash'), Object.prototype.hasOwnProperty.call(row, 'torrent_hash')];
+});
+
 const MOVIE = { id: 27205, source: 'tmdb', title: 'Начало', original_title: 'Inception', release_date: '2010-07-15', vote_average: 8.4 };
 const movie = (extra) => Object.assign({}, MOVIE, extra || {});
 

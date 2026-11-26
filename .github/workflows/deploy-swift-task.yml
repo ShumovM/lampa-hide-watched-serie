@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'supabase/functions/swift-task/**'
+  workflow_dispatch:
 
 permissions:
   contents: read

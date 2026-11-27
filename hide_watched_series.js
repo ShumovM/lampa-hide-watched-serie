@@ -44,7 +44,8 @@
         debug: 'hws_debug',
         syncUrl: 'hws_sync_url',
         syncCode: 'hws_sync_code',
-        syncId: 'hws_sync_id'
+        syncId: 'hws_sync_id',
+        syncProfile: 'hws_sync_profile_id'
     };
 
     var DEFAULT_THRESHOLD = 90;
@@ -762,13 +763,20 @@
         var syncRemoteSeen = null;
         var syncLastError = '';
         var syncLastSuccess = 0;
-        var syncDiagnostics = { status: 'not_configured', checkedAt: 0, lastSync: 0, push: '', pull: '', error: '' };
+        var syncDiagnostics = { status: 'not_configured', checkedAt: 0, lastSync: 0, push: '', pull: '', error: '', pullPages: 0,
+            received: { episode_progress: 0, movie_watched_marks: 0, series_torrent_resume: 0 },
+            applied: { episode_progress: 0, movie_watched_marks: 0, series_torrent_resume: 0 } };
         var syncChecking = false;
         var syncApplyError = false;
         try {
             var savedDiagnostics = storage() && storage().getItem(SYNC_DIAG_KEY);
             if (savedDiagnostics) syncDiagnostics = JSON.parse(savedDiagnostics);
         } catch (e) {}
+        if (!syncDiagnostics || typeof syncDiagnostics !== 'object') syncDiagnostics = {};
+        if (!syncDiagnostics.received || typeof syncDiagnostics.received !== 'object') syncDiagnostics.received = {};
+        if (!syncDiagnostics.applied || typeof syncDiagnostics.applied !== 'object') syncDiagnostics.applied = {};
+        if (typeof syncDiagnostics.pullPages !== 'number') syncDiagnostics.pullPages = 0;
+        if (typeof syncDiagnostics.lastSync !== 'number') syncDiagnostics.lastSync = 0;
         syncLastSuccess = syncDiagnostics.lastSync || 0;
 
         function syncSaveDiagnostics() {
@@ -797,7 +805,7 @@
         }
 
         function syncValidResponse(response, action) {
-            return Boolean(response && typeof response === 'object' && response.success === true && (action !== 'sync' || (response.data && typeof response.data === 'object')));
+            return Boolean(response && typeof response === 'object' && response.success === true && (action !== 'sync' || (response.data && isArray(response.data.episode_progress) && isArray(response.data.movie_watched_marks) && isArray(response.data.series_torrent_resume))));
         }
         var syncRequestId = 0;
 
@@ -838,6 +846,9 @@
         }
 
         function syncProfile() {
+            var overrideValue = setting(SETTINGS.syncProfile, '');
+            var override = syncString(typeof overrideValue === 'number' ? String(overrideValue) : overrideValue);
+            if (override) return override.slice(0, 128);
             try {
                 var account = L().Storage.get('account');
 
@@ -1078,9 +1089,10 @@
         }
 
         function syncApplyRows(table, rows) {
-            if (!isArray(rows) || !rows.length) return;
+            if (!isArray(rows) || !rows.length) return 0;
 
             var seen = syncRemoteSeen[table];
+            var applied = 0;
             var i;
             var row;
             var key;
@@ -1109,6 +1121,7 @@
                             if (current) {
                                 delete viewed[row.timeline_hash];
                                 changed = true;
+                                applied++;
                             }
                             continue;
                         }
@@ -1118,6 +1131,7 @@
                             card: row.card || undefined, season: row.season, episode: row.episode
                         };
                         changed = true;
+                        applied++;
                     }
 
                     if (changed) {
@@ -1129,6 +1143,7 @@
                 } catch (e) {
                     syncApplying = false;
                     syncApplyError = true;
+                    applied = 0;
                     log('sync timeline restore error', e && e.message);
                 }
             } else if (table === 'movie_watched_marks') {
@@ -1146,14 +1161,18 @@
                     var currentMarkTime = currentMark ? syncTime(currentMark.t) : 0;
                     if (currentMarkTime >= updated) continue;
 
-                    if (row.is_deleted) delete marks[movieKeyValue];
-                    else marks[movieKeyValue] = { t: updated, title: row.title || '' };
+                    if (row.is_deleted) {
+                        if (currentMark) { delete marks[movieKeyValue]; movieChanged = true; applied++; }
+                        continue;
+                    }
+                    marks[movieKeyValue] = { t: updated, title: row.title || '' };
                     movieChanged = true;
+                    applied++;
                 }
 
                 if (movieChanged) {
-                    saveMovieMarks();
-                    updateBadges();
+                    if (saveMovieMarks()) updateBadges();
+                    else { syncApplyError = true; applied = 0; }
                 }
             } else if (table === 'series_torrent_resume') {
                 var torrentItems = loadTorrents();
@@ -1174,12 +1193,16 @@
                         season: toInt(row.season_number), episode: toInt(row.episode_number), t: updated
                     };
                     torrentsChanged = true;
+                    applied++;
                 }
 
-                if (torrentsChanged) saveTorrents();
+                if (torrentsChanged && !saveTorrents()) { syncApplyError = true; applied = 0; }
             }
 
             refreshStatsScreen();
+            syncDiagnostics.applied[table] = (syncDiagnostics.applied[table] || 0) + applied;
+            syncSaveDiagnostics();
+            return applied;
         }
 
         function syncAck(batch) {
@@ -1249,11 +1272,17 @@
                 }
 
                 if (batch.items.length) syncAck(batch.items);
-                syncDiagnostics.pull = 'Успешно: получены страницы данных'; syncSaveDiagnostics(); refreshSyncScreen();
                 var data = response.data || {};
+                syncDiagnostics.pullPages = (syncDiagnostics.pullPages || 0) + 1;
+                syncDiagnostics.received = syncDiagnostics.received || {};
+                syncDiagnostics.applied = syncDiagnostics.applied || {};
+                syncDiagnostics.received.episode_progress = (syncDiagnostics.received.episode_progress || 0) + data.episode_progress.length;
+                syncDiagnostics.received.movie_watched_marks = (syncDiagnostics.received.movie_watched_marks || 0) + data.movie_watched_marks.length;
+                syncDiagnostics.received.series_torrent_resume = (syncDiagnostics.received.series_torrent_resume || 0) + data.series_torrent_resume.length;
                 syncApplyRows('episode_progress', data.episode_progress || []);
                 syncApplyRows('movie_watched_marks', data.movie_watched_marks || []);
                 syncApplyRows('series_torrent_resume', data.series_torrent_resume || []);
+                syncDiagnostics.pull = 'Прочитано страниц: ' + syncDiagnostics.pullPages; syncSaveDiagnostics(); refreshSyncScreen();
                 if (syncApplyError) { syncApplyError = false; syncSaveFailure('apply_error', 'pull'); return callback('apply_error'); }
 
                 var next = response.next;
@@ -1277,6 +1306,10 @@
 
             syncBusy = true;
             syncRemoteSeen = { episode_progress: {}, movie_watched_marks: {}, series_torrent_resume: {} };
+            syncDiagnostics.pullPages = 0;
+            syncDiagnostics.received = { episode_progress: 0, movie_watched_marks: 0, series_torrent_resume: 0 };
+            syncDiagnostics.applied = { episode_progress: 0, movie_watched_marks: 0, series_torrent_resume: 0 };
+            syncSaveDiagnostics();
             syncPullPage({}, function (err) {
                 syncBusy = false;
                 syncLastError = err || '';
@@ -1339,7 +1372,7 @@
         }
 
         function syncStatus() {
-            return { enabled: Boolean(syncEndpoint() && syncCode()), endpoint: syncEndpoint().replace(/[?#].*$/, ''), busy: syncBusy || syncChecking, status: syncDiagnostics.status, checkedAt: syncDiagnostics.checkedAt, lastSync: syncDiagnostics.lastSync, push: syncDiagnostics.push, pull: syncDiagnostics.pull, error: syncDiagnostics.error };
+            return { enabled: Boolean(syncEndpoint() && syncCode()), endpoint: syncEndpoint().replace(/[?#].*$/, ''), profileId: syncProfile(), busy: syncBusy || syncChecking, status: syncDiagnostics.status, checkedAt: syncDiagnostics.checkedAt, lastSync: syncDiagnostics.lastSync, push: syncDiagnostics.push, pull: syncDiagnostics.pull, pullPages: syncDiagnostics.pullPages || 0, received: syncDiagnostics.received || {}, applied: syncDiagnostics.applied || {}, error: syncDiagnostics.error };
         }
 
         function syncStart() {
@@ -2249,7 +2282,8 @@
             try {
                 var ls = storage();
 
-                if (ls) ls.setItem(MOVIES_KEY, JSON.stringify({ v: MOVIES_VERSION, items: loadMovieMarks() }));
+                if (!ls) return false;
+                ls.setItem(MOVIES_KEY, JSON.stringify({ v: MOVIES_VERSION, items: loadMovieMarks() }));
 
                 return true;
             } catch (e) {
@@ -2410,7 +2444,10 @@
             var labels = { not_configured: 'Не настроено', checking: 'Проверка соединения', unavailable: 'Сервер недоступен', auth_error: 'Ошибка авторизации', connected: 'Подключено', sync_error: 'Ошибка синхронизации' };
             function date(value) { return value ? new Date(value).toLocaleString() : '—'; }
             function safe(value) { return String(value || '—').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-            return '<div class="hws-sync-diagnostics"><h2>Синхронизация Supabase</h2><p><b>Статус:</b> ' + (labels[d.status] || 'Ошибка синхронизации') + '</p><p><b>URL:</b> ' + safe(d.endpoint) + '</p><p><b>Последняя успешная проверка:</b> ' + date(d.checkedAt) + '</p><p><b>Последняя успешная синхронизация:</b> ' + date(d.lastSync) + '</p><p><b>Push:</b> ' + safe(d.push) + '</p><p><b>Pull:</b> ' + safe(d.pull) + '</p><p><b>Последняя ошибка:</b> ' + safe(d.error) + '</p><p>Проверка sync выполняет только чтение; успешный health сам по себе не подтверждает синхронизацию. Реальные push, pull и применение данных диагностируются при штатном обмене.</p></div>';
+            var names = { episode_progress: 'Timeline', movie_watched_marks: 'Фильмы', series_torrent_resume: 'Раздачи' };
+            var counts = '';
+            for (var table in names) if (Object.prototype.hasOwnProperty.call(names, table)) counts += '<p><b>' + names[table] + ':</b> получено ' + ((d.received && d.received[table]) || 0) + ', применено ' + ((d.applied && d.applied[table]) || 0) + '</p>';
+            return '<div class="hws-sync-diagnostics"><h2>Синхронизация Supabase</h2><p><b>Статус:</b> ' + (labels[d.status] || 'Ошибка синхронизации') + '</p><p><b>URL:</b> ' + safe(d.endpoint) + '</p><p><b>Профиль запроса:</b> ' + safe(d.profileId) + '</p><p><b>Последняя успешная проверка:</b> ' + date(d.checkedAt) + '</p><p><b>Последняя успешная синхронизация:</b> ' + date(d.lastSync) + '</p><p><b>Push:</b> ' + safe(d.push) + '</p><p><b>Pull:</b> ' + safe(d.pull) + ' (' + d.pullPages + ' стр.)</p>' + counts + '<p><b>Последняя ошибка:</b> ' + safe(d.error) + '</p><p>Проверка sync выполняет только чтение; успешный health сам по себе не подтверждает синхронизацию. Реальные push, pull и применение данных диагностируются при штатном обмене.</p></div>';
         }
 
         var syncScreenOpen = false;
@@ -2849,9 +2886,12 @@
 
                 var ls = storage();
 
-                if (ls) ls.setItem(TORRENTS_KEY, JSON.stringify({ v: TORRENTS_VERSION, items: items }));
+                if (!ls) return false;
+                ls.setItem(TORRENTS_KEY, JSON.stringify({ v: TORRENTS_VERSION, items: items }));
+                return true;
             } catch (e) {
                 log('torrents save error', e && e.message);
+                return false;
             }
         }
 
@@ -3739,6 +3779,7 @@
                 });
 
                 api.addParam({ component: syncComponent, param: { name: 'hws_sync_diagnostics', type: 'button' }, field: { name: 'Показать диагностику', description: 'Статус подключения, обмена и последняя ошибка' }, onChange: showSyncDiagnostics });
+                api.addParam({ component: syncComponent, param: { name: SETTINGS.syncProfile, type: 'input', values: {}, placeholder: 'пусто — профиль Lampa', 'default': '' }, field: { name: 'Профиль синхронизации (необязательно)', description: 'Если на устройствах разные профили Lampa, укажите одинаковый profile_id с устройства, где есть нужная история' }, onChange: function () { scheduleSync(1000); } });
                 api.addParam({ component: syncComponent, param: { name: 'hws_sync_check', type: 'button' }, field: { name: 'Проверить подключение', description: 'Health и безопасное чтение контракта sync без отправки данных' }, onChange: function () {
                     try {
                         if (win.console && typeof win.console.log === 'function') win.console.log(LOG_TAG, 'sync diagnostic: button pressed');

@@ -53,7 +53,10 @@ globalThis.fetch = async (input, init = {}) => {
             { id: '9', sync_id: 'house', profile_id: '0', source: 'tmdb', series_id: '9', title: 'Show 3', magnet: 'magnet:?xt=three', torrent_hash: 'legacy-hash-3', season_number: 2, episode_number: 1, device_id: 'dev-a', updated_at: '2026-01-03T00:00:01Z', sync_updated_at: '2026-01-03T00:00:00Z' }
         ]
     };
-    const page = fixtures[table].slice(offset, offset + Number(url.searchParams.get('limit')));
+    const syncId = (url.searchParams.get('sync_id') || '').replace(/^eq\./, '');
+    const profileId = (url.searchParams.get('profile_id') || '').replace(/^eq\./, '');
+    const scoped = fixtures[table].filter((row) => String(row.sync_id) === syncId && String(row.profile_id) === profileId);
+    const page = scoped.slice(offset, offset + Number(url.searchParams.get('limit')));
     return new Response(JSON.stringify(page), { status: 200, headers: { 'Content-Type': 'application/json' } });
 };
 
@@ -161,6 +164,24 @@ test('uses SUPABASE_SECRET_KEYS.default and returns old/new compatible rows with
     const secondBody = await second.json();
     assert.equal(secondBody.success, true);
     assert.deepEqual(secondBody.more, { episode_progress: false, movie_watched_marks: false, series_torrent_resume: false });
+});
+
+test('filters rows by exact sync_id and profile_id; unknown local profile receives no rows', async () => {
+    calls.length = 0;
+    const mismatch = await handler(request({ action: 'sync', sync_id: 'house', profile_id: 'main' }));
+    const mismatchBody = await mismatch.json();
+    assert.equal(mismatchBody.success, true);
+    assert.equal(mismatchBody.data.episode_progress.length, 0);
+    assert.equal(mismatchBody.data.movie_watched_marks.length, 0);
+    assert.ok(calls.every((call) => call.url.searchParams.get('sync_id') === 'eq.house' && call.url.searchParams.get('profile_id') === 'eq.main'));
+
+    calls.length = 0;
+    const match = await handler(request({ action: 'sync', sync_id: 'house', profile_id: '0' }));
+    const matchBody = await match.json();
+    assert.equal(matchBody.success, true);
+    assert.equal(matchBody.data.episode_progress.length, 3);
+    assert.equal(matchBody.data.movie_watched_marks.length, 3);
+    assert.ok(calls.every((call) => call.url.searchParams.get('sync_id') === 'eq.house' && call.url.searchParams.get('profile_id') === 'eq.0'));
 });
 
 test('push sends all three table batches through the RPC', async () => {

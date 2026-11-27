@@ -246,6 +246,7 @@ function createEnv(opts) {
     const timeline = {};
     const history = [];
     const viewed = [];
+    const favorites = (opts.favorites || []).slice();
     const timetable = {};
 
     // Lampa хранит настройки и в памяти (readed), и в localStorage
@@ -260,6 +261,8 @@ function createEnv(opts) {
         ls,
         timeline,
         history,
+        favorites,
+        favoriteRemovals: [],
         settings,
         timetable
     };
@@ -355,8 +358,20 @@ function createEnv(opts) {
         get(params) {
             if (params.type === 'history') return history.slice();
             if (params.type === 'viewed') return viewed.slice();
+            if (params.type === 'book') return favorites.slice();
 
             return [];
+        },
+        remove(type, card) {
+            env.favoriteRemovals.push({ type, card });
+
+            if (opts.favoriteRemoveFails) throw new Error('favorite removal failed');
+
+            if (type !== 'book') return;
+
+            for (let i = favorites.length - 1; i >= 0; i--) {
+                if (favorites[i] === card || (favorites[i].id == card.id && favorites[i].source === card.source)) favorites.splice(i, 1);
+            }
         },
         // как continues() в lampa-source 2.3.0 (src/utils/favorite.js)
         continues(type) {
@@ -505,7 +520,7 @@ function createEnv(opts) {
             return out;
         };
     } else {
-        const tmdbSource = { category: (params) => rowsFromCategory(params, 'category'), main: () => [{ title: 'Сейчас смотрят', results: history.slice() }] };
+        const tmdbSource = { category: (params) => rowsFromCategory(params, 'category'), main: () => (opts.mainRows || [{ title: 'Сейчас смотрят', results: history.slice() }]).slice() };
         const cubSource = { category: (params) => rowsFromCategory(params, 'category'), main: () => [] };
         const sources = { tmdb: tmdbSource, cub: cubSource };
 

@@ -41,6 +41,23 @@
 
 Другие используемые API включают `Lampa.Timeline.view/update/link/watchedEpisode/listener`, `Lampa.TimeTable.get`, `Lampa.Storage.get/set`, `Lampa.SettingsApi`, `Lampa.Listener`, `Lampa.Reguest`, `Lampa.TMDB`, `Lampa.Lang`, `Lampa.Noty`, `Lampa.Activity` и `Lampa.Manifest`. Доступ к API проверяется защитными условиями и `try/catch`, поскольку версии отличаются.
 
+### Главная лента «Избранное»
+
+`favoriteRows()` получает штатные закладки через `Lampa.Favorite.get({type:'book'})`. `favoriteKey()`
+оставляет только карточки фильмов/сериалов и устраняет дубли. `favoriteHasStarted()` проверяет
+Timeline-прогресс: в Lampa 3.x — устойчивую карточную привязку `Timeline.link()` и поля карточки
+в Timeline-записи; в Lampa 2.3.0 — hash фильма либо доступных серий сезона 1. Элемент с положительным
+прогрессом не показывается. `reconcileStartedFavorites()` пытается снять отметку штатным
+`Favorite.remove('book', card)`; в случае ошибки список ленты всё равно фильтруется по Timeline.
+
+Регистрация адаптирована к разнице API главного экрана: в 3.x `registerFavoriteFeed()` добавляет
+строку через `ContentRows.add()` с индексом после `continue_watch`; в 2.3.0 `patchLegacyMain()`
+оборачивает `Api.sources.tmdb.main()` и `addFavoriteRowToMain()` вставляет строку после Continue,
+если он присутствует. В чистой 2.3.0 штатного Continue на главной нет, поэтому строка ставится после
+первой главной ленты. Данные закладок не копируются в хранилище плагина. При старте и событии
+`Timeline.listener` → `update` выполняется reconciliation; при неудачном снятии отметки начатый
+элемент остаётся скрыт, пока его Timeline-прогресс сохраняется.
+
 ## Логика скрытия сериалов
 
 Чистые функции верхнего уровня (`planSeasons`, `evaluate`, `shouldHide`, `isFinished`, `needsCheck`) отделены от интеграции и экспортируются в `HideWatchedSeries.Core` для тестов.
@@ -146,7 +163,7 @@ npm test
 
 Команда последовательно запускает:
 
-1. `node tests/run.js` — проверки чистой логики, имитации Lampa API, UI и регрессий, включая дедупликацию статистики, запуск/остановку экрана через `Activity.push()` в режимах Lampa 2.3.0 и 3.x, и отсутствие сопоставления hash-only Timeline записей.
+1. `node tests/run.js` — проверки чистой логики, имитации Lampa API, UI и регрессий, включая главную ленту избранного на 2.3.0/3.x, автоматическое снятие/скрытие начатых элементов, статистику и lifecycle экрана.
 2. `node tests/check_es5.js` — parser-based ES5/API compatibility check.
 3. `node --experimental-strip-types --test tests/supabase_sync.test.mjs` — 9 тестов Edge Function и SQL/client contract.
 

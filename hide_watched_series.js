@@ -671,6 +671,8 @@
         var started = false;
         var categoryDepth = 0;
         var originalContinues = null;
+        var favoriteFeedRegistered = false;
+        var startedFavorites = {};
         var warmupTimer = null;
         var stats = { hidden: 0, checks: 0, errors: 0 };
         var marking = null;
@@ -3156,6 +3158,287 @@
             return wrapped;
         }
 
+        function favoriteRows() {
+            try {
+                var favorite = L().Favorite;
+                var list = favorite && typeof favorite.get === 'function' ? favorite.get({ type: 'book' }) : [];
+
+                return isArray(list) ? list : [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        function favoriteKey(card) {
+            if (!card || !card.id) return null;
+            if (isTvCard(card)) return 'tv|' + (seriesKey(card) || '');
+            if (isMovieCard(card)) return 'movie|' + (movieKey(card) || '');
+
+            return null;
+        }
+
+        function favoriteTimeline() {
+            try {
+                var timeline = L().Timeline;
+                var filename = timeline && typeof timeline.filename === 'function' ? timeline.filename() : 'file_view';
+                var data = L().Storage.get(filename, {});
+
+                if (typeof data === 'string') data = JSON.parse(data || '{}');
+
+                return data && typeof data === 'object' ? data : {};
+            } catch (e) {
+                return {};
+            }
+        }
+
+        function favoriteLink(card) {
+            try {
+                var timeline = L().Timeline;
+
+                if (timeline && typeof timeline.link === 'function') {
+                    var tv = isTvCard(card);
+                    var link = timeline.link(card, tv ? 1 : undefined, tv ? 1 : undefined);
+
+                    // Timeline.link() infers media type from original_name. Do not
+                    // trust a returned movie key for a TV favorite lacking that field.
+                    if (link && link.card && ((tv && /(^|_)tv_[a-z0-9]+$/.test(link.card)) || (!tv && /(^|_)movie_[a-z0-9]+$/.test(link.card)))) return link;
+                }
+            } catch (e) {}
+
+            return null;
+        }
+
+        function hasLinkedFavoriteProgress(card, timelineData) {
+            var link = favoriteLink(card);
+
+            if (!link || !link.card) return false;
+
+            for (var hashValue in timelineData) {
+                if (!Object.prototype.hasOwnProperty.call(timelineData, hashValue)) continue;
+                var road = timelineData[hashValue];
+
+                if (!road || typeof road !== 'object' || road.card !== link.card || (parseFloat(road.percent) || 0) <= 0) continue;
+
+                if (isTvCard(card) && (toInt(road.season) < 1 || toInt(road.episode) < 1)) continue;
+
+                return true;
+            }
+
+            return false;
+        }
+
+        function hasLegacyFavoriteProgress(card) {
+            var timeline = L().Timeline;
+            var titles = titleCandidates(card);
+            var episodes = [];
+            var seen = {};
+            var i;
+
+            if (!titles.length) return false;
+
+            if (isTvCard(card)) {
+                episodes.push({ season: 1, episode: 1 });
+
+                try {
+                    var local = localEpisodes(card);
+
+                    for (i = 0; i < local.length; i++) {
+                        var season = toInt(typeof local[i].season_number !== 'undefined' ? local[i].season_number : local[i].season);
+                        var episode = toInt(typeof local[i].episode_number !== 'undefined' ? local[i].episode_number : local[i].episode);
+
+                        if (season < 1 || episode < 1) continue;
+                        episodes.push({ season: season, episode: episode });
+                    }
+                } catch (e) {}
+            } else {
+                episodes.push({ movie: true });
+            }
+
+            for (i = 0; i < episodes.length; i++) {
+                var ref = episodes[i];
+                var refKey = ref.movie ? 'movie' : ref.season + ':' + ref.episode;
+
+                if (seen[refKey]) continue;
+                seen[refKey] = true;
+
+                for (var j = 0; j < titles.length; j++) {
+                    var key = ref.movie ? titles[j] : episodeKey(ref.season, ref.episode, titles[j]);
+                    var percent = percentOf(hash(key));
+
+                    if (percent > 0) return true;
+                }
+            }
+
+            if (timeline && typeof timeline.watchedEpisode === 'function' && isTvCard(card)) {
+                try {
+                    return (parseFloat(timeline.watchedEpisode(card, 1, 1)) || 0) > 0;
+                } catch (e) {}
+            }
+
+            return false;
+        }
+
+        function favoriteHasStarted(card) {
+            var key = favoriteKey(card);
+
+            if (!key) return false;
+            if (startedFavorites['$' + key]) return true;
+
+            var timelineData = favoriteTimeline();
+            var started = hasLinkedFavoriteProgress(card, timelineData) || hasLegacyFavoriteProgress(card);
+
+            if (started) startedFavorites['$' + key] = true;
+
+            return started;
+        }
+
+        function favoriteFeedItems() {
+            var source = favoriteRows();
+            var result = [];
+            var seen = {};
+
+            for (var i = 0; i < source.length; i++) {
+                var card = source[i];
+                var key = favoriteKey(card);
+
+                if (!key || seen['$' + key] || favoriteHasStarted(card)) continue;
+
+                seen['$' + key] = true;
+                result.push(card);
+            }
+
+            return result;
+        }
+
+        function favoriteFeedRow() {
+            var results = favoriteFeedItems();
+
+            return results.length ? { title: 'Избранное', results: results } : null;
+        }
+
+        function addFavoriteRowToMain(rows) {
+            if (!isArray(rows)) return rows;
+
+            var result = rows.slice();
+            var position = -1;
+
+            for (var i = 0; i < result.length; i++) {
+                if (result[i] && result[i].title === 'Избранное') {
+                    position = i;
+                    break;
+                }
+            }
+
+            if (position >= 0) result.splice(position, 1);
+
+            var row = favoriteFeedRow();
+
+            if (!row) return result;
+
+            var title = continueTitle();
+            position = -1;
+
+            if (title) {
+                for (i = 0; i < result.length; i++) {
+                    if (result[i] && result[i].title === title) {
+                        position = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            // Lampa 2.3.0 does not ship a Continue row on its home page. If another
+            // plugin adds one to the main result, use it as the anchor; otherwise
+            // place Favorites immediately after the first native home row.
+            if (position < 0) position = Math.min(1, result.length);
+            result.splice(position, 0, row);
+
+            return result;
+        }
+
+        function patchLegacyMain() {
+            var api = L().Api;
+            var sources = api && api.sources;
+            var source = sources && sources.tmdb;
+            var target = source && typeof source.main === 'function' ? source : api;
+            var method = source && typeof source.main === 'function' ? 'main' : 'main';
+
+            if (!target || typeof target[method] !== 'function' || target[method].__hws_favorite_feed) return false;
+
+            var original = target[method];
+            var wrapped = function () {
+                var result = original.apply(this, arguments);
+
+                return addFavoriteRowToMain(result);
+            };
+
+            wrapped.__hws_favorite_feed = original;
+            target[method] = wrapped;
+
+            return true;
+        }
+
+        function registerFavoriteFeed() {
+            if (favoriteFeedRegistered) return true;
+
+            var rows = L().ContentRows;
+
+            if (rows && typeof rows.add === 'function') {
+                try {
+                    rows.add({
+                        name: 'hws_favorites',
+                        title: 'Избранное',
+                        index: 2,
+                        screen: ['main'],
+                        call: function () {
+                            var row = favoriteFeedRow();
+
+                            if (!row) return;
+
+                            return function (call) { call(row); };
+                        }
+                    });
+                    favoriteFeedRegistered = true;
+
+                    return true;
+                } catch (e) {}
+            }
+
+            favoriteFeedRegistered = patchLegacyMain();
+
+            return favoriteFeedRegistered;
+        }
+
+        function reconcileStartedFavorites() {
+            var favorite = L().Favorite;
+            var source = favoriteRows();
+            var removed = false;
+
+            if (!favorite || typeof favorite.remove !== 'function') return;
+
+            for (var i = 0; i < source.length; i++) {
+                var card = source[i];
+                var key = favoriteKey(card);
+                var started;
+
+                if (!key || startedFavorites['$' + key]) continue;
+                started = favoriteHasStarted(card);
+                if (!started) continue;
+
+                startedFavorites['$' + key] = true;
+
+                try {
+                    favorite.remove('book', card);
+                } catch (e) {
+                    log('favorite remove failed', key, e && e.message);
+                }
+
+                removed = true;
+            }
+
+            if (removed) refreshRows();
+        }
+
         /* ---------- настройки в интерфейсе ---------- */
 
         function addSettings() {
@@ -3296,6 +3579,7 @@
 
             scheduleWarmup(5000);
             refreshStatsScreen();
+            reconcileStartedFavorites();
         }
 
         function start() {
@@ -3309,6 +3593,8 @@
                 if (lampa.ContentRows && typeof lampa.ContentRows.call === 'function') mode = patchRows() ? 'rows' : 'none';
                 else mode = patchLegacy() ? 'legacy' : 'none';
 
+                registerFavoriteFeed();
+
                 addSettings();
 
                 try {
@@ -3316,6 +3602,8 @@
                         lampa.Timeline.listener.follow('update', onTimelineUpdate);
                     }
                 } catch (e) {}
+
+                reconcileStartedFavorites();
 
                 try {
                     if (lampa.Listener && typeof lampa.Listener.follow === 'function') lampa.Listener.follow('full', onFull);

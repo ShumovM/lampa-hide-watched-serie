@@ -53,8 +53,10 @@ Timeline-прогресс: в Lampa 3.x — устойчивую карточн�
 Регистрация адаптирована к разнице API главного экрана. В 3.x `registerFavoriteFeed()` добавляет
 Favorite через `ContentRows.add()`, но порядок не полагается на `index`: обёртка `patchRows()` после
 штатного `ContentRows.call()` переставляет помеченный callback Favorite в начало, а callback
-штатного Continue — на вторую позицию. Continue распознаётся во время `ContentRows.call()` по
-вызову `Favorite.continues('tv')`; остальные callbacks остаются в изначальном относительном порядке.
+штатного Continue — на вторую позицию. Continue распознаётся по вызову `Favorite.continues('tv')`.
+Если сборка не позволяет пометить нативный callback, плагин добавляет вторую строку через
+`Favorite.continues('tv')` и скрывает дубликат с тем же заголовком. Остальные callbacks остаются в
+изначальном относительном порядке.
 В 2.3.0 `patchLegacyMain()` оборачивает `Api.sources.tmdb.main()`, а
 `addFavoriteRowToMain()` ставит Favorite первым и существующий Continue вторым. В чистой 2.3.0
 штатной строки Continue на главной нет. Данные закладок не копируются в хранилище плагина. При старте и событии

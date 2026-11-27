@@ -3150,15 +3150,43 @@
                     }
                 }
 
+                var fallbackContinue = false;
+                if (main && isArray(calls)) {
+                    var hasNativeContinue = false;
+
+                    for (var j = 0; j < calls.length; j++) {
+                        if (calls[j] && calls[j].__hws_native_continue_row) hasNativeContinue = true;
+                    }
+
+                    if (!hasNativeContinue && favorite && typeof favorite.continues === 'function') {
+                        try {
+                            var continueItems = favorite.continues('tv');
+
+                            if (isArray(continueItems) && continueItems.length) {
+                                var continueCall = function (call) {
+                                    call({ title: continueTitle(), results: continueItems });
+                                };
+                                continueCall.__hws_continue_feed_row = true;
+                                calls.splice(Math.min(1, calls.length), 0, continueCall);
+                                fallbackContinue = true;
+                            }
+                        } catch (e) {}
+                    }
+                }
+
                 if (before && (screen === 'main' || screen === 'category')) {
                     for (var i = 0; i < calls.length; i++) {
                         var fn = calls[i];
 
-                        if (typeof fn === 'function' && !fn.__hws_row && before.indexOf(fn) === -1) calls[i] = wrapRow(fn, screen);
+                        if (typeof fn === 'function' && !fn.__hws_row && before.indexOf(fn) === -1) {
+                            calls[i] = wrapRow(fn, screen, Boolean(main && fallbackContinue && !fn.__hws_continue_feed_row));
+                        }
                     }
                 }
 
-                if (main && isArray(calls)) prioritizeMainRows(calls);
+                if (main && isArray(calls)) {
+                    prioritizeMainRows(calls);
+                }
 
                 return result;
             };
@@ -3180,7 +3208,7 @@
                 var call = calls[i];
 
                 if (call && call.__hws_favorite_feed_row) favorite.push(call);
-                else if (call && call.__hws_native_continue_row) continued.push(call);
+                else if (call && (call.__hws_native_continue_row || call.__hws_continue_feed_row)) continued.push(call);
                 else rest.push(call);
             }
 
@@ -3199,7 +3227,7 @@
             }
         }
 
-        function wrapRow(fn, screen) {
+        function wrapRow(fn, screen, suppressContinue) {
             var wrapped = function (call) {
                 var args = Array.prototype.slice.call(arguments);
 
@@ -3208,7 +3236,10 @@
                         try {
                             var title = continueTitle();
 
-                            if (json && title && json.title === title && isArray(json.results)) json.results = filterList(json.results, screen);
+                            if (json && title && json.title === title) {
+                                if (screen === 'main' && suppressContinue && !wrapped.__hws_continue_feed_row) return;
+                                if (isArray(json.results)) json.results = filterList(json.results, screen);
+                            }
                         } catch (e) {}
 
                         return call.apply(this, arguments);
@@ -3221,6 +3252,7 @@
             wrapped.__hws_row = true;
             if (fn.__hws_favorite_feed_row) wrapped.__hws_favorite_feed_row = true;
             if (fn.__hws_native_continue_row) wrapped.__hws_native_continue_row = true;
+            if (fn.__hws_continue_feed_row) wrapped.__hws_continue_feed_row = true;
 
             return wrapped;
         }

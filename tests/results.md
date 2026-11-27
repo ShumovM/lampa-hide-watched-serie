@@ -1,8 +1,8 @@
 # Результаты автотестов hide_watched_series
 
-Запуск: `node tests/run.js`, Node v24.14.0, 2026-11-27T10:30:22.650Z
+Запуск: `node tests/run.js`, Node v24.14.0, 2026-11-27T10:53:45.142Z
 
-**Всего: 133, успешно: 133, неуспешно: 0**
+**Всего: 134, успешно: 134, неуспешно: 0**
 
 | № | Проверка | Ожидаемый результат | Фактический результат | Итог |
 |---|---|---|---|---|
@@ -104,7 +104,8 @@
 | T11 | Запуск через обёртку передаёт аргументы в Lampa без изменений | `[1,"start",247718]` | `[1,"start",247718]` | OK |
 | ST1 | Статистика дедуплицирует эпизоды и фильмы, разделяет аниме и исключает неизвестные записи | `{"movies":{"count":2,"seconds":5400,"missingDuration":1},"series":{"count":1,"episodes":2,"seconds":1800,"missingDuration":1},"anime":{"count":1,"episodes":1,"seconds":1500,"missingDuration":0},"unclassified":2,"totalSeconds":8700}` | `{"movies":{"count":2,"seconds":5400,"missingDuration":1},"series":{"count":1,"episodes":2,"seconds":1800,"missingDuration":1},"anime":{"count":1,"episodes":1,"seconds":1500,"missingDuration":0},"unclassified":2,"totalSeconds":8700}` | OK |
 | ST2 | Кнопка статистики открывает зарегистрированный экран через Activity.push в Lampa 2.3.0 и 3.x | `[true,true]` | `[true,true]` | OK |
-| ST3 | Длительность отображается в днях/часах и неизвестное время не подменяется | `["1 д 1 ч","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | `["1 д 1 ч","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | OK |
+| ST3 | Длительность отображается в днях/часах, а неизвестная длительность помечается отдельно | `["1 д 1 ч","Нет данных","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | `["1 д 1 ч","Нет данных","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | OK |
+| ST4 | Hash-only Timeline записи не связываются с карточками и не принимают позицию за длительность | `{"movies":{"count":0,"seconds":0,"missingDuration":0},"series":{"count":0,"episodes":0,"seconds":0,"missingDuration":0},"anime":{"count":0,"episodes":0,"seconds":0,"missingDuration":0},"unclassified":2,"totalSeconds":0}` | `{"movies":{"count":0,"seconds":0,"missingDuration":0},"series":{"count":0,"episodes":0,"seconds":0,"missingDuration":0},"anime":{"count":0,"episodes":0,"seconds":0,"missingDuration":0},"unclassified":2,"totalSeconds":0}` | OK |
 | S1 | Синхронизация сохраняет обычный Timeline update в офлайн-очередь | `[1,"episode_progress","ep-offline"]` | `[1,"episode_progress","ep-offline"]` | OK |
 | S2 | Pull восстанавливает Timeline, отметку фильма и торрент без link | `[88,true,"magnet:?xt=one","","test-code"]` | `[88,true,"magnet:?xt=one","","test-code"]` | OK |
 | S3 | Более свежая локальная запись побеждает старую серверную | `[91,91,"ep"]` | `[91,91,"ep"]` | OK |

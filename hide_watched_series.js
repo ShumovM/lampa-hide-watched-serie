@@ -612,6 +612,11 @@
         return parts.length ? parts.join(' ') : '0 ч';
     }
 
+    function formatStatsDurationOrUnknown(seconds, missingDuration) {
+        if ((Number(seconds) || 0) <= 0 && (Number(missingDuration) || 0) > 0) return 'Нет данных';
+        return formatStatsDuration(seconds);
+    }
+
     var Core = {
         hashString: hashString,
         episodeKey: episodeKey,
@@ -627,6 +632,7 @@
         needsCheck: needsCheck,
         calculateStats: calculateStats,
         formatStatsDuration: formatStatsDuration,
+        formatStatsDurationOrUnknown: formatStatsDurationOrUnknown,
         SOFT_TTL: SOFT_TTL,
         HARD_TTL: HARD_TTL,
         RETRY_TTL: RETRY_TTL,
@@ -2229,11 +2235,11 @@
                     '<div class="hws-stats__card"><div class="hws-stats__label">АНИМЕ</div><div class="hws-stats__value">' + data.anime.count + '</div></div>' +
                 '</div>' +
                 '<div class="hws-stats__episodes"><div class="hws-stats__label">ПРОСМОТРЕНО СЕРИЙ</div><div class="hws-stats__value">' + (data.series.episodes + data.anime.episodes) + '</div></div>' +
-                '<div class="hws-stats__total"><div class="hws-stats__label">УЧТЁННАЯ ДЛИТЕЛЬНОСТЬ КОНТЕНТА</div><div class="hws-stats__total-value">' + formatStatsDuration(data.totalSeconds) + '</div></div>' +
+                '<div class="hws-stats__total"><div class="hws-stats__label">УЧТЁННАЯ ДЛИТЕЛЬНОСТЬ КОНТЕНТА</div><div class="hws-stats__total-value">' + formatStatsDurationOrUnknown(data.totalSeconds, data.movies.missingDuration + data.series.missingDuration + data.anime.missingDuration) + '</div></div>' +
                 '<div class="hws-stats__breakdown">' +
-                    '<div><span>Фильмы</span><strong>' + formatStatsDuration(data.movies.seconds) + '</strong></div>' +
-                    '<div><span>Сериалы</span><strong>' + formatStatsDuration(data.series.seconds) + '</strong></div>' +
-                    '<div><span>Аниме</span><strong>' + formatStatsDuration(data.anime.seconds) + '</strong></div>' +
+                    '<div><span>Фильмы</span><strong>' + formatStatsDurationOrUnknown(data.movies.seconds, data.movies.missingDuration) + '</strong></div>' +
+                    '<div><span>Сериалы</span><strong>' + formatStatsDurationOrUnknown(data.series.seconds, data.series.missingDuration) + '</strong></div>' +
+                    '<div><span>Аниме</span><strong>' + formatStatsDurationOrUnknown(data.anime.seconds, data.anime.missingDuration) + '</strong></div>' +
                 '</div>' + warning +
                 '<div class="hws-stats__note">Фильм учитывается по отметке плагина или по Timeline от ' + threshold() + '%. Сериал и аниме — если есть хотя бы одна серия от этого порога. Время — сумма длительности уникальных завершённых записей, не фактическое время перед экраном.</div>' +
                 '<div class="hws-stats__note">' + statsSyncNote() + '</div>' +
@@ -2261,6 +2267,14 @@
 
             this.render = function () {
                 return html;
+            };
+
+            this.start = function () {
+                statsScreenOpen = true;
+            };
+
+            this.stop = function () {
+                statsScreenOpen = false;
             };
 
             this.destroy = function () {

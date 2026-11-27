@@ -1891,7 +1891,11 @@ check('ST2', 'Кнопка статистики открывает зареги�
 
         const screen = new Screen(route);
         const view = screen.create();
+        if (typeof screen.start !== 'function' || typeof screen.stop !== 'function') return false;
+        screen.start();
         const html = view && view.nodes && view.nodes[0] && view.nodes[0].html;
+        screen.stop();
+        screen.destroy();
 
         return Boolean(html && html.indexOf('ПРОСМОТРЕНО СЕРИЙ') >= 0 && html.indexOf('не фактическое время перед экраном') >= 0 && typeof screen.destroy === 'function');
     }
@@ -1899,14 +1903,25 @@ check('ST2', 'Кнопка статистики открывает зареги�
     return [checkVersion('2.3.0'), checkVersion('3.x')];
 });
 
-check('ST3', 'Длительность отображается в днях/часах и неизвестное время не подменяется', ['1 д 1 ч', '0 ч', 'Показаны Timeline активного профиля и локальные отметки фильмов.'], () => {
+check('ST3', 'Длительность отображается в днях/часах, а неизвестная длительность помечается отдельно', ['1 д 1 ч', 'Нет данных', '0 ч', 'Показаны Timeline активного профиля и локальные отметки фильмов.'], () => {
     const env = fresh();
     const button = env.Lampa.SettingsApi.params.find((item) => item.param.name === 'hws_open_stats');
     button.onChange();
     const Screen = env.Lampa.Component.registered.hide_watched_series_stats_screen;
     const view = new Screen(env.Lampa.Activity.pushes[0]).create();
-    return [Core.formatStatsDuration(90000), Core.formatStatsDuration(0), view.nodes[0].html.match(/Показаны Timeline[^<]*/)[0]];
+    return [Core.formatStatsDuration(90000), Core.formatStatsDurationOrUnknown(0, 3), Core.formatStatsDurationOrUnknown(0, 0), view.nodes[0].html.match(/Показаны Timeline[^<]*/)[0]];
 });
+
+check('ST4', 'Hash-only Timeline записи не связываются с карточками и не принимают позицию за длительность', {
+    movies: { count: 0, seconds: 0, missingDuration: 0 },
+    series: { count: 0, episodes: 0, seconds: 0, missingDuration: 0 },
+    anime: { count: 0, episodes: 0, seconds: 0, missingDuration: 0 },
+    unclassified: 2,
+    totalSeconds: 0
+}, () => Core.calculateStats({
+    'legacy-hash-1': 100,
+    'legacy-hash-2': { percent: 100, time: 5400, duration: 0 }
+}, {}, [], 90));
 
 /* ---------------- Отчёт ---------------- */
 async function runAsyncChecks() {

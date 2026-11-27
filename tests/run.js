@@ -1878,15 +1878,22 @@ check('ST1', 'Статистика дедуплицирует эпизоды и 
     { id: 20, source: 'tmdb', original_name: 'Anime', original_language: 'ja', number_of_seasons: 1 }
 ], 90));
 
-check('ST2', 'Раздел Статистика и экран открываются через SettingsApi в Lampa 2.3.0 и 3.x', [true, true], () => {
+check('ST2', 'Кнопка статистики открывает зарегистрированный экран через Activity.push в Lampa 2.3.0 и 3.x', [true, true], () => {
     function checkVersion(version) {
         const env = fresh({ version });
         const component = env.Lampa.SettingsApi.components.find((item) => item.component === 'hide_watched_series_stats');
         const button = env.Lampa.SettingsApi.params.find((item) => item.param.name === 'hws_open_stats');
         if (!component || !button || typeof button.onChange !== 'function') return false;
         button.onChange();
-        const modal = env.Lampa.Modal.opened[0];
-        return Boolean(modal && modal.title === 'Статистика просмотра' && modal.html.indexOf('ПРОСМОТРЕНО СЕРИЙ') >= 0 && modal.html.indexOf('не фактическое время перед экраном') >= 0);
+        const route = env.Lampa.Activity.pushes[0];
+        const Screen = env.Lampa.Component.registered.hide_watched_series_stats_screen;
+        if (!route || route.component !== 'hide_watched_series_stats_screen' || route.title !== 'Статистика просмотра' || typeof Screen !== 'function') return false;
+
+        const screen = new Screen(route);
+        const view = screen.create();
+        const html = view && view.nodes && view.nodes[0] && view.nodes[0].html;
+
+        return Boolean(html && html.indexOf('ПРОСМОТРЕНО СЕРИЙ') >= 0 && html.indexOf('не фактическое время перед экраном') >= 0 && typeof screen.destroy === 'function');
     }
 
     return [checkVersion('2.3.0'), checkVersion('3.x')];
@@ -1896,7 +1903,9 @@ check('ST3', 'Длительность отображается в днях/ча
     const env = fresh();
     const button = env.Lampa.SettingsApi.params.find((item) => item.param.name === 'hws_open_stats');
     button.onChange();
-    return [Core.formatStatsDuration(90000), Core.formatStatsDuration(0), env.Lampa.Modal.opened[0].html.match(/Показаны Timeline[^<]*/)[0]];
+    const Screen = env.Lampa.Component.registered.hide_watched_series_stats_screen;
+    const view = new Screen(env.Lampa.Activity.pushes[0]).create();
+    return [Core.formatStatsDuration(90000), Core.formatStatsDuration(0), view.nodes[0].html.match(/Показаны Timeline[^<]*/)[0]];
 });
 
 /* ---------------- Отчёт ---------------- */

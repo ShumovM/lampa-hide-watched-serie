@@ -425,6 +425,10 @@ function createEnv(opts) {
             addComponent(c) { this.components.push(c); },
             addParam(p) { this.params.push(p); }
         },
+        Component: {
+            registered: {},
+            add(name, component) { this.registered[name] = component; }
+        },
         Noty: { show(text) { env.noty.push(text); } },
         // Torrent из interaction/torrent.js 3.x: start(element, movie) / open(hash, movie)
         Torrent: {
@@ -445,6 +449,8 @@ function createEnv(opts) {
         // Activity.all(): элементы {component, activity}; refresh() как в 2.3.0/3.x
         Activity: {
             stack: [],
+            pushes: [],
+            push(params) { this.pushes.push(params); this.stack.push(params); },
             all() { return this.stack; },
             active() { return this.stack[this.stack.length - 1]; }
         }

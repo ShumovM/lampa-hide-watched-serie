@@ -1132,7 +1132,7 @@
                 if (torrentsChanged) saveTorrents();
             }
 
-            refreshStatsModal();
+            refreshStatsScreen();
         }
 
         function syncAck(batch) {
@@ -2025,7 +2025,7 @@
             try {
                 var movie = e.data && e.data.movie;
                 rememberStatsCard(movie);
-                refreshStatsModal();
+                refreshStatsScreen();
                 var series = markable(movie);
 
                 if (!series && !isMovieCard(movie)) return;
@@ -2083,7 +2083,8 @@
         var badgeObserver = null;
         var badgeRoots = [];
         var badgeTimer = null;
-        var statsModalOpen = false;
+        var statsScreenOpen = false;
+        var statsScreenRegistered = false;
         var statsMetadata = [];
 
         function hasClass(el, name) {
@@ -2248,22 +2249,57 @@
             (d.head || d.body).appendChild(style);
         }
 
+        function StatsScreen() {
+            var html = win.$('<div class="hws-stats-screen">' + statsMarkup() + '</div>');
+
+            this.create = function () {
+                statsScreenOpen = true;
+                injectStatsStyle();
+
+                return this.render();
+            };
+
+            this.render = function () {
+                return html;
+            };
+
+            this.destroy = function () {
+                statsScreenOpen = false;
+            };
+        }
+
+        function registerStatsScreen() {
+            var component = L().Component;
+
+            if (!component || typeof component.add !== 'function') return false;
+            if (statsScreenRegistered) return true;
+
+            try {
+                component.add('hide_watched_series_stats_screen', StatsScreen);
+                statsScreenRegistered = true;
+
+                return true;
+            } catch (e) {
+                log('statistics component registration error', e && e.message);
+
+                return false;
+            }
+        }
+
         function showStats() {
             try {
-                var modal = L().Modal;
-                if (!modal || typeof modal.open !== 'function') return notify('Раздел статистики не поддерживается этой версией Lampa');
-                injectStatsStyle();
-                statsModalOpen = true;
-                modal.open({ title: 'Статистика просмотра', html: statsMarkup(), size: 'large', align: 'top', mask: true });
+                var activity = L().Activity;
+                if (!registerStatsScreen() || !activity || typeof activity.push !== 'function') return notify('Раздел статистики не поддерживается этой версией Lampa');
+
+                activity.push({ url: '', title: 'Статистика просмотра', component: 'hide_watched_series_stats_screen', page: 1 });
             } catch (e) {
-                statsModalOpen = false;
                 log('statistics open error', e && e.message);
                 notify('Не удалось открыть статистику');
             }
         }
 
-        function refreshStatsModal() {
-            if (!statsModalOpen) return;
+        function refreshStatsScreen() {
+            if (!statsScreenOpen) return;
             try {
                 var d = doc();
                 var view = d && d.querySelector('.hws-stats');
@@ -2312,7 +2348,7 @@
             }
 
             updateBadges();
-            refreshStatsModal();
+            refreshStatsScreen();
 
             return Boolean(watched);
         }
@@ -3245,7 +3281,7 @@
             }
 
             scheduleWarmup(5000);
-            refreshStatsModal();
+            refreshStatsScreen();
         }
 
         function start() {

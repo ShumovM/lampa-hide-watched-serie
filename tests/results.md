@@ -1,6 +1,6 @@
 # Результаты автотестов hide_watched_series
 
-Запуск: `node tests/run.js`, Node v24.14.0, 2026-11-27T10:08:17.327Z
+Запуск: `node tests/run.js`, Node v24.14.0, 2026-11-27T10:30:22.650Z
 
 **Всего: 133, успешно: 133, неуспешно: 0**
 
@@ -103,7 +103,7 @@
 | T10 | Повторная загрузка: Torrent.start обёрнут один раз, обработчик torrent_file один | `[true,1]` | `[true,1]` | OK |
 | T11 | Запуск через обёртку передаёт аргументы в Lampa без изменений | `[1,"start",247718]` | `[1,"start",247718]` | OK |
 | ST1 | Статистика дедуплицирует эпизоды и фильмы, разделяет аниме и исключает неизвестные записи | `{"movies":{"count":2,"seconds":5400,"missingDuration":1},"series":{"count":1,"episodes":2,"seconds":1800,"missingDuration":1},"anime":{"count":1,"episodes":1,"seconds":1500,"missingDuration":0},"unclassified":2,"totalSeconds":8700}` | `{"movies":{"count":2,"seconds":5400,"missingDuration":1},"series":{"count":1,"episodes":2,"seconds":1800,"missingDuration":1},"anime":{"count":1,"episodes":1,"seconds":1500,"missingDuration":0},"unclassified":2,"totalSeconds":8700}` | OK |
-| ST2 | Раздел Статистика и экран открываются через SettingsApi в Lampa 2.3.0 и 3.x | `[true,true]` | `[true,true]` | OK |
+| ST2 | Кнопка статистики открывает зарегистрированный экран через Activity.push в Lampa 2.3.0 и 3.x | `[true,true]` | `[true,true]` | OK |
 | ST3 | Длительность отображается в днях/часах и неизвестное время не подменяется | `["1 д 1 ч","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | `["1 д 1 ч","0 ч","Показаны Timeline активного профиля и локальные отметки фильмов."]` | OK |
 | S1 | Синхронизация сохраняет обычный Timeline update в офлайн-очередь | `[1,"episode_progress","ep-offline"]` | `[1,"episode_progress","ep-offline"]` | OK |
 | S2 | Pull восстанавливает Timeline, отметку фильма и торрент без link | `[88,true,"magnet:?xt=one","","test-code"]` | `[88,true,"magnet:?xt=one","","test-code"]` | OK |

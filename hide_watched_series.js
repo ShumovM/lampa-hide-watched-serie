@@ -3237,7 +3237,10 @@
                             var title = continueTitle();
 
                             if (json && title && json.title === title) {
-                                if (screen === 'main' && suppressContinue && !wrapped.__hws_continue_feed_row) return;
+                                // ContentRows callbacks are part of Lampa's sequential feed loader.
+                                // An empty call skips this duplicate row while still allowing the
+                                // loader to advance to every row after it.
+                                if (screen === 'main' && suppressContinue && !wrapped.__hws_continue_feed_row) return call();
                                 if (isArray(json.results)) json.results = filterList(json.results, screen);
                             }
                         } catch (e) {}

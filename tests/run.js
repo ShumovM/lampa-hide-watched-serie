@@ -1658,7 +1658,7 @@ check('HF8', 'Lampa 3.x: Timeline link обнаруживает начатый �
     return [env.favorites.length, env.favoriteRemovals.length];
 });
 
-check('HF9', 'Lampa 3.x fallback: Continue идёт вторым и немаркированный дубль ряда подавляется', ['Избранное', 'Продолжить просмотр', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть'], () => {
+check('HF9', 'Lampa 3.x fallback: Continue идёт вторым, дубль пропускается без остановки очереди рядов', [['Избранное', 'Продолжить просмотр', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть'], true], () => {
     const env = fresh({
         version: '3.x',
         favorites: [MOVIE],
@@ -1673,7 +1673,14 @@ check('HF9', 'Lampa 3.x fallback: Continue идёт вторым и немарк
 
     env.history.push(series({ id: 30003, name: 'Продолжается', original_name: 'Continuing' }));
 
-    return env.buildScreen('main').map((row) => row.title);
+    const titles = env.buildScreen('main').map((row) => row.title);
+    const calls = [];
+    let completed = 0;
+
+    env.Lampa.ContentRows.call('main', {}, calls);
+    calls.forEach((fn) => fn(() => { completed++; }));
+
+    return [titles, completed === calls.length && calls.length > 0];
 });
 
 // Список файлов как в interaction/torrent.js list(): list_open → render ×N; serverHash — хеш TorrServer

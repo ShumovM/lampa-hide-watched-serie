@@ -1995,6 +1995,40 @@ check('SD5', 'Диагностика сохраняется после пере�
     return Boolean(restarted.win.HideWatchedSeries.syncStatus().error);
 });
 
+check('SD6', 'Кнопка вызывает обработчик в Lampa 2.3.0 и 3.x, показывает прогресс, блокирует дубль и показывает успех', [true, true], () => {
+    function run(version) {
+        const env = createEnv({ version, settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'hidden' } });
+        const pending = [];
+        let calls = 0;
+        env.install({ syncRequest(url, code, body, done) { calls++; pending.push({ body, done }); } });
+        const button = env.Lampa.SettingsApi.params.find((p) => p.param.name === 'hws_sync_check');
+        button.onChange();
+        const progress = env.noty.indexOf('Проверка подключения…') >= 0;
+        button.onChange();
+        const guarded = calls === 1;
+        pending[0].done(null, { success: true });
+        pending[1].done(null, { success: true, data: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } });
+        return progress && guarded && env.noty.indexOf('Подключено. Health и sync-контракт проверены') >= 0;
+    }
+    return [run('2.3.0'), run('3.x')];
+});
+
+check('SD7', 'Кнопка отображает таймаут и исключение запроса, после завершения снова доступна', ['Таймаут соединения', 'sync_error', true, true], () => {
+    const env = createEnv({ settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'hidden' } });
+    let done;
+    let calls = 0;
+    env.install({ syncRequest(url, code, body, callback) { calls++; if (body.action === 'health') done = callback; else callback('timeout'); } });
+    const button = env.Lampa.SettingsApi.params.find((p) => p.param.name === 'hws_sync_check');
+    button.onChange(); done(null, { success: true });
+    const timeoutVisible = env.noty.indexOf('Таймаут соединения') >= 0;
+    const status = env.win.HideWatchedSeries.syncStatus().status;
+    button.onChange(); const retryAllowed = calls === 3;
+    const env2 = createEnv({ settings: { hws_sync_url: 'https://project.supabase.co', hws_sync_code: 'hidden' } });
+    env2.install({ syncRequest() { throw new Error('network'); } });
+    env2.Lampa.SettingsApi.params.find((p) => p.param.name === 'hws_sync_check').onChange();
+    return [timeoutVisible ? 'Таймаут соединения' : '', status, env2.noty.some((text) => text.indexOf('Не удалось выполнить запрос:') === 0), retryAllowed];
+});
+
 check('ST1', 'Статистика дедуплицирует эпизоды и фильмы, разделяет аниме и исключает неизвестные записи', {
     movies: { count: 2, seconds: 5400, missingDuration: 1 },
     series: { count: 1, episodes: 2, seconds: 1800, missingDuration: 1 },

@@ -1301,19 +1301,41 @@
             if (syncChecking || syncBusy) return false;
             syncChecking = true;
             syncDiagnostics.status = 'checking'; syncDiagnostics.error = ''; syncSaveDiagnostics();
+            var completed = false;
+            function diagLog(stage) {
+                try { if (win.console && typeof win.console.log === 'function') win.console.log(LOG_TAG, 'sync diagnostic:', stage); } catch (e) {}
+            }
             function finish(status, error) {
+                if (completed) return;
+                completed = true;
                 syncChecking = false; syncDiagnostics.status = status; if (status === 'connected') syncDiagnostics.checkedAt = clock();
-                syncDiagnostics.error = error || ''; syncSaveDiagnostics(); if (callback) callback(syncStatus());
+                syncDiagnostics.error = error || ''; syncSaveDiagnostics();
+                diagLog(status === 'connected' ? 'check complete' : 'check error: ' + syncSafeError(error));
+                if (callback) { try { callback(syncStatus()); } catch (e) { diagLog('result callback error'); } }
             }
             if (!syncEndpoint() || !syncCode()) { finish('not_configured', 'Укажите URL сервера и код синхронизации'); return true; }
-            syncRequest(syncEndpoint(), syncCode(), { action: 'health' }, function (err, health) {
-                if (err || !health || health.success !== true) return finish(err === 'unauthorized' ? 'auth_error' : 'unavailable', syncSafeError(err || 'invalid_response'));
-                syncRequest(syncEndpoint(), syncCode(), { action: 'sync', sync_id: syncNamespace(), profile_id: syncProfile(), device_id: syncDeviceId(), offset: 0, cursor: {}, limit: 1, changes: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } }, function (syncErr, response) {
-                    if (syncErr || !syncValidResponse(response, 'sync') || !response.data.episode_progress || !response.data.movie_watched_marks || !response.data.series_torrent_resume) return finish(syncErr === 'unauthorized' ? 'auth_error' : 'sync_error', syncSafeError(syncErr || 'invalid_response'));
-                    finish('connected', 'Health и read-only sync-контракт проверены; фактический обмен проверяется штатной синхронизацией.');
+            diagLog('check started');
+            try {
+                diagLog('health request');
+                syncRequest(syncEndpoint(), syncCode(), { action: 'health' }, function (err, health) {
+                    if (err || !health || health.success !== true) return finish(err === 'unauthorized' ? 'auth_error' : 'unavailable', syncSafeError(err || 'invalid_response'));
+                    try {
+                        diagLog('sync contract request');
+                        syncRequest(syncEndpoint(), syncCode(), { action: 'sync', sync_id: syncNamespace(), profile_id: syncProfile(), device_id: syncDeviceId(), offset: 0, cursor: {}, limit: 1, changes: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } }, function (syncErr, response) {
+                            if (syncErr || !syncValidResponse(response, 'sync') || !response.data.episode_progress || !response.data.movie_watched_marks || !response.data.series_torrent_resume) return finish(syncErr === 'unauthorized' ? 'auth_error' : 'sync_error', syncSafeError(syncErr || 'invalid_response'));
+                            finish('connected', 'Health и read-only sync-контракт проверены; фактический обмен проверяется штатной синхронизацией.');
+                        });
+                    } catch (e) { finish('sync_error', 'Ошибка проверки sync-контракта: ' + syncSafeError(e && e.message)); }
                 });
-            });
+            } catch (e) { finish('unavailable', 'Не удалось выполнить запрос: ' + syncSafeError(e && e.message)); }
             return true;
+        }
+
+        function syncCheckMessage(result) {
+            if (!result.enabled) return 'Синхронизация Supabase не настроена: укажите URL и код';
+            if (result.status === 'connected') return 'Подключено. Health и sync-контракт проверены';
+            if (result.status === 'checking') return 'Проверка подключения…';
+            return result.error || (result.status === 'auth_error' ? 'Ошибка авторизации' : 'Ошибка проверки подключения');
         }
 
         function syncStatus() {
@@ -3717,7 +3739,14 @@
                 });
 
                 api.addParam({ component: syncComponent, param: { name: 'hws_sync_diagnostics', type: 'button' }, field: { name: 'Показать диагностику', description: 'Статус подключения, обмена и последняя ошибка' }, onChange: showSyncDiagnostics });
-                api.addParam({ component: syncComponent, param: { name: 'hws_sync_check', type: 'button' }, field: { name: 'Проверить подключение', description: 'Health и безопасное чтение контракта sync без отправки данных' }, onChange: function () { if (!syncCheck(function () { refreshSyncScreen(); })) notify('Проверка или синхронизация уже выполняется'); } });
+                api.addParam({ component: syncComponent, param: { name: 'hws_sync_check', type: 'button' }, field: { name: 'Проверить подключение', description: 'Health и безопасное чтение контракта sync без отправки данных' }, onChange: function () {
+                    try {
+                        if (win.console && typeof win.console.log === 'function') win.console.log(LOG_TAG, 'sync diagnostic: button pressed');
+                        if (!syncCheck(function (result) { refreshSyncScreen(); notify(syncCheckMessage(result)); })) return notify('Проверка подключения уже выполняется');
+                        if (win.console && typeof win.console.log === 'function') win.console.log(LOG_TAG, 'sync diagnostic: button handler called');
+                        if (syncStatus().busy) notify('Проверка подключения…');
+                    } catch (e) { notify('Не удалось запустить проверку подключения'); }
+                } });
 
                 api.addParam({
                     component: component,

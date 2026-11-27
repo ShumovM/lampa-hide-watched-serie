@@ -437,6 +437,181 @@
         return age > RETRY_TTL;
     }
 
+    function statsIdentity(source, type, id) {
+        source = (source || 'tmdb').toString().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        if (!source || source === 'cub') source = 'tmdb';
+        id = (id === null || typeof id === 'undefined' ? '' : String(id)).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        if (!id || (type !== 'movie' && type !== 'tv')) return null;
+
+        return source + '|' + type + '|' + id;
+    }
+
+    function statsIdentityFromLink(value) {
+        var match = /^(?:(.+)_)?(movie|tv)_([a-z0-9_-]+)$/i.exec(String(value || '').toLowerCase());
+
+        if (!match) return null;
+
+        return statsIdentity(match[1] || 'tmdb', match[2], match[3]);
+    }
+
+    function statsTimestamp(value) {
+        if (typeof value === 'number' && isFinite(value)) return value;
+        if (typeof value === 'string' && value) {
+            var parsed = new Date(value).getTime();
+            return isNaN(parsed) ? 0 : parsed;
+        }
+
+        return 0;
+    }
+
+    /**
+     * Считает только просмотренные записи с устойчивой связью Lampa card/season/episode.
+     * Длительность — сумма известной полной длительности завершённых единиц контента,
+     * а не фактическое время, проведённое перед экраном.
+     */
+    function calculateStats(timeline, movieMarks, cards, limit) {
+        var result = {
+            movies: { count: 0, seconds: 0, missingDuration: 0 },
+            series: { count: 0, episodes: 0, seconds: 0, missingDuration: 0 },
+            anime: { count: 0, episodes: 0, seconds: 0, missingDuration: 0 },
+            unclassified: 0,
+            totalSeconds: 0
+        };
+        var animeMap = {};
+        var movieItems = {};
+        var episodeItems = {};
+        var seriesItems = { series: {}, anime: {} };
+        var unknownEpisodes = {};
+        var threshold = parseFloat(limit);
+        var key;
+        var i;
+
+        if (isNaN(threshold)) threshold = DEFAULT_THRESHOLD;
+        timeline = timeline && typeof timeline === 'object' ? timeline : {};
+        movieMarks = movieMarks && typeof movieMarks === 'object' ? movieMarks : {};
+        cards = isArray(cards) ? cards : [];
+
+        for (i = 0; i < cards.length; i++) {
+            var card = cards[i] || {};
+            if (!isTvCard(card)) continue;
+            var identity = statsIdentity(card.source, 'tv', card.id);
+            if (!identity) continue;
+            var hasLanguage = typeof card.original_language === 'string' && Boolean(card.original_language);
+            var category = isAnimeCard(card) ? 'anime' : (hasLanguage ? 'series' : 'unknown');
+            var mapKey = '$' + identity;
+
+            if (typeof animeMap[mapKey] === 'undefined') animeMap[mapKey] = category;
+            else if (animeMap[mapKey] !== category) animeMap[mapKey] = 'unknown';
+        }
+
+        for (key in movieMarks) {
+            if (!Object.prototype.hasOwnProperty.call(movieMarks, key)) continue;
+            var markKey = String(key).toLowerCase();
+            if (markKey.indexOf('cub_') === 0) markKey = 'tmdb_' + markKey.slice(4);
+            if (!/^[a-z0-9_-]+_[a-z0-9_-]+$/.test(markKey)) {
+                result.unclassified++;
+                continue;
+            }
+            movieItems['$movie|' + markKey] = { marked: true, completed: true, duration: 0, durationAt: -1 };
+        }
+
+        for (key in timeline) {
+            if (!Object.prototype.hasOwnProperty.call(timeline, key)) continue;
+            var road = timeline[key];
+            if (typeof road === 'number') road = { percent: road };
+            if (!road || typeof road !== 'object') continue;
+            var percent = parseFloat(road.percent) || 0;
+            var linkedIdentity = statsIdentityFromLink(road.card);
+
+            if (!linkedIdentity) {
+                if (percent >= threshold) result.unclassified++;
+                continue;
+            }
+
+            var parts = linkedIdentity.split('|');
+            var kind = parts[1];
+            var duration = parseFloat(road.duration) || 0;
+            var updated = statsTimestamp(road.updated);
+
+            if (kind === 'movie') {
+                var movieBucketKey = '$movie|' + parts[0] + '_' + parts[2];
+                var movie = movieItems[movieBucketKey];
+                if (!movie && percent >= threshold) movie = movieItems[movieBucketKey] = { marked: false, completed: false, duration: 0, durationAt: -1 };
+                if (!movie) continue;
+                if (percent >= threshold) movie.completed = true;
+                if (duration > 0 && (updated >= movie.durationAt) && (movie.marked || percent >= threshold)) {
+                    movie.duration = duration;
+                    movie.durationAt = updated;
+                }
+            } else {
+                var season = parseInt(road.season, 10);
+                var episode = parseInt(road.episode, 10);
+                if (percent < threshold) continue;
+                if (isNaN(season) || season < 1 || isNaN(episode) || episode < 1) {
+                    result.unclassified++;
+                    continue;
+                }
+
+                var episodeIdentity = linkedIdentity + '|' + season + '|' + episode;
+                var episodeBucketKey = '$' + episodeIdentity;
+                var item = episodeItems[episodeBucketKey];
+                if (!item) item = episodeItems[episodeBucketKey] = { series: linkedIdentity, duration: 0, durationAt: -1 };
+                if (duration > 0 && updated >= item.durationAt) {
+                    item.duration = duration;
+                    item.durationAt = updated;
+                }
+            }
+        }
+
+        for (key in movieItems) {
+            if (!Object.prototype.hasOwnProperty.call(movieItems, key)) continue;
+            var movieItem = movieItems[key];
+            if (!movieItem.marked && !movieItem.completed) continue;
+            result.movies.count++;
+            if (movieItem.duration > 0) result.movies.seconds += movieItem.duration;
+            else result.movies.missingDuration++;
+        }
+
+        for (key in episodeItems) {
+            if (!Object.prototype.hasOwnProperty.call(episodeItems, key)) continue;
+            var episodeItem = episodeItems[key];
+            var type = animeMap['$' + episodeItem.series];
+            if (type !== 'series' && type !== 'anime') {
+                unknownEpisodes[key] = true;
+                continue;
+            }
+
+            var group = type === 'anime' ? result.anime : result.series;
+            var set = type === 'anime' ? seriesItems.anime : seriesItems.series;
+            set['$' + episodeItem.series] = true;
+            group.episodes++;
+            if (episodeItem.duration > 0) group.seconds += episodeItem.duration;
+            else group.missingDuration++;
+        }
+
+        result.unclassified += Object.keys(unknownEpisodes).length;
+        result.series.count = Object.keys(seriesItems.series).length;
+        result.anime.count = Object.keys(seriesItems.anime).length;
+        result.totalSeconds = result.movies.seconds + result.series.seconds + result.anime.seconds;
+
+        return result;
+    }
+
+    function formatStatsDuration(seconds) {
+        seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+        var minutes = Math.floor(seconds / 60);
+        var days = Math.floor(minutes / (24 * 60));
+        var hours = Math.floor((minutes - days * 24 * 60) / 60);
+        var rest = minutes % 60;
+        var parts = [];
+
+        if (days) parts.push(days + ' д');
+        if (hours || days) parts.push(hours + ' ч');
+        if (rest && !days) parts.push(rest + ' мин');
+
+        return parts.length ? parts.join(' ') : '0 ч';
+    }
+
     var Core = {
         hashString: hashString,
         episodeKey: episodeKey,
@@ -450,6 +625,8 @@
         shouldHide: shouldHide,
         isFinished: isFinished,
         needsCheck: needsCheck,
+        calculateStats: calculateStats,
+        formatStatsDuration: formatStatsDuration,
         SOFT_TTL: SOFT_TTL,
         HARD_TTL: HARD_TTL,
         RETRY_TTL: RETRY_TTL,
@@ -954,6 +1131,8 @@
 
                 if (torrentsChanged) saveTorrents();
             }
+
+            refreshStatsModal();
         }
 
         function syncAck(batch) {
@@ -1845,6 +2024,8 @@
 
             try {
                 var movie = e.data && e.data.movie;
+                rememberStatsCard(movie);
+                refreshStatsModal();
                 var series = markable(movie);
 
                 if (!series && !isMovieCard(movie)) return;
@@ -1902,6 +2083,8 @@
         var badgeObserver = null;
         var badgeRoots = [];
         var badgeTimer = null;
+        var statsModalOpen = false;
+        var statsMetadata = [];
 
         function hasClass(el, name) {
             return Boolean(el && typeof el.className === 'string' && (' ' + el.className + ' ').indexOf(' ' + name + ' ') !== -1);
@@ -1976,6 +2159,120 @@
             }
         }
 
+        function rememberStatsCard(card) {
+            if (!isTvCard(card)) return;
+            var identity = statsIdentity(card.source, 'tv', card.id);
+            if (!identity) return;
+
+            for (var i = 0; i < statsMetadata.length; i++) {
+                if (statsIdentity(statsMetadata[i].source, 'tv', statsMetadata[i].id) === identity) {
+                    statsMetadata[i] = card;
+                    return;
+                }
+            }
+
+            statsMetadata.push(card);
+        }
+
+        function viewingStats() {
+            var timeline = {};
+            var cards = [];
+
+            try {
+                var timelineApi = L().Timeline;
+                var filename = timelineApi && typeof timelineApi.filename === 'function' ? timelineApi.filename() : 'file_view';
+                timeline = L().Storage.get(filename, {});
+                if (typeof timeline === 'string') timeline = JSON.parse(timeline || '{}');
+            } catch (e) {
+                timeline = {};
+            }
+
+            try {
+                var favorite = L().Favorite;
+                var history = favorite && typeof favorite.get === 'function' ? favorite.get({ type: 'history' }) : [];
+                if (isArray(history)) cards = cards.concat(history);
+            } catch (e) {}
+
+            // Проверочный кеш хранит только название, поэтому из него берём лишь
+            // однозначно японское название; латинское нельзя считать доказательством не-аниме.
+            var cached = loadCache();
+            for (var id in cached) {
+                if (!Object.prototype.hasOwnProperty.call(cached, id)) continue;
+                if (cached[id] && cached[id].title && JAPANESE_RE.test(cached[id].title)) {
+                    cards.push({ id: id, source: 'tmdb', original_name: cached[id].title });
+                }
+            }
+
+            cards = cards.concat(statsMetadata);
+
+            return calculateStats(timeline, loadMovieMarks(), cards, threshold());
+        }
+
+        function statsSyncNote() {
+            if (!syncEndpoint() || !syncCode()) return 'Показаны Timeline активного профиля и локальные отметки фильмов.';
+            if (syncBusy) return 'Синхронизация загружает данные. Экран обновится по мере их получения.';
+            if (syncLastError) return 'Последняя синхронизация завершилась с ошибкой; часть данных может отсутствовать.';
+            if (!syncLastSuccess) return 'Серверная история ещё не загружена. После синхронизации статистика обновится.';
+            return 'Показаны Timeline активного профиля и локальные отметки, объединённые с загруженными данными Supabase.';
+        }
+
+        function statsMarkup() {
+            var data = viewingStats();
+            var incomplete = data.unclassified || data.movies.missingDuration || data.series.missingDuration || data.anime.missingDuration;
+            var warning = incomplete ? '<div class="hws-stats__warning">Часть истории не включена в точные подсчёты: записей без надёжной связи — ' + data.unclassified + '; просмотренных единиц без длительности — ' + (data.movies.missingDuration + data.series.missingDuration + data.anime.missingDuration) + '.</div>' : '<div class="hws-stats__note">Все найденные завершённые записи имеют подходящие данные для подсчёта.</div>';
+
+            return '<div class="hws-stats">' +
+                '<div class="hws-stats__cards">' +
+                    '<div class="hws-stats__card"><div class="hws-stats__label">ФИЛЬМЫ</div><div class="hws-stats__value">' + data.movies.count + '</div></div>' +
+                    '<div class="hws-stats__card"><div class="hws-stats__label">СЕРИАЛЫ</div><div class="hws-stats__value">' + data.series.count + '</div><div class="hws-stats__hint">без аниме</div></div>' +
+                    '<div class="hws-stats__card"><div class="hws-stats__label">АНИМЕ</div><div class="hws-stats__value">' + data.anime.count + '</div></div>' +
+                '</div>' +
+                '<div class="hws-stats__episodes"><div class="hws-stats__label">ПРОСМОТРЕНО СЕРИЙ</div><div class="hws-stats__value">' + (data.series.episodes + data.anime.episodes) + '</div></div>' +
+                '<div class="hws-stats__total"><div class="hws-stats__label">УЧТЁННАЯ ДЛИТЕЛЬНОСТЬ КОНТЕНТА</div><div class="hws-stats__total-value">' + formatStatsDuration(data.totalSeconds) + '</div></div>' +
+                '<div class="hws-stats__breakdown">' +
+                    '<div><span>Фильмы</span><strong>' + formatStatsDuration(data.movies.seconds) + '</strong></div>' +
+                    '<div><span>Сериалы</span><strong>' + formatStatsDuration(data.series.seconds) + '</strong></div>' +
+                    '<div><span>Аниме</span><strong>' + formatStatsDuration(data.anime.seconds) + '</strong></div>' +
+                '</div>' + warning +
+                '<div class="hws-stats__note">Фильм учитывается по отметке плагина или по Timeline от ' + threshold() + '%. Сериал и аниме — если есть хотя бы одна серия от этого порога. Время — сумма длительности уникальных завершённых записей, не фактическое время перед экраном.</div>' +
+                '<div class="hws-stats__note">' + statsSyncNote() + '</div>' +
+            '</div>';
+        }
+
+        function injectStatsStyle() {
+            var d = doc();
+            if (!d || d.getElementById('hws-stats-style')) return;
+            var style = d.createElement('style');
+            style.id = 'hws-stats-style';
+            style.textContent = '.hws-stats{width:100%;max-width:58em;color:#f4f5f7;font-size:1em;line-height:1.35}.hws-stats__cards{display:flex;flex-wrap:wrap;gap:.75em}.hws-stats__card{box-sizing:border-box;flex:1 1 28%;min-width:9em;padding:1em;border-radius:.65em;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.08)}.hws-stats__label{font-size:.72em;letter-spacing:.11em;opacity:.68}.hws-stats__value{font-size:2.1em;font-weight:700;line-height:1.15;margin-top:.22em}.hws-stats__hint{font-size:.72em;opacity:.65}.hws-stats__episodes,.hws-stats__total{margin-top:.8em;padding:1em 1.15em;border-radius:.65em;background:rgba(255,255,255,.06)}.hws-stats__total{background:linear-gradient(110deg,rgba(0,200,83,.2),rgba(255,255,255,.06))}.hws-stats__total-value{font-size:1.8em;font-weight:700;margin-top:.2em}.hws-stats__breakdown{display:flex;flex-wrap:wrap;gap:.5em;margin-top:.6em}.hws-stats__breakdown div{box-sizing:border-box;flex:1 1 30%;min-width:9em;display:flex;justify-content:space-between;gap:.5em;padding:.85em 1em;border-radius:.55em;background:rgba(255,255,255,.045)}.hws-stats__warning,.hws-stats__note{margin-top:.75em;padding:.7em .9em;border-radius:.45em;background:rgba(255,255,255,.045);font-size:.78em;opacity:.8}.hws-stats__warning{border-left:.22em solid #f0ad4e;opacity:1}@media(max-width:800px){.hws-stats__card{flex-basis:44%}.hws-stats__breakdown div{flex-basis:100%}}';
+            (d.head || d.body).appendChild(style);
+        }
+
+        function showStats() {
+            try {
+                var modal = L().Modal;
+                if (!modal || typeof modal.open !== 'function') return notify('Раздел статистики не поддерживается этой версией Lampa');
+                injectStatsStyle();
+                statsModalOpen = true;
+                modal.open({ title: 'Статистика просмотра', html: statsMarkup(), size: 'large', align: 'top', mask: true });
+            } catch (e) {
+                statsModalOpen = false;
+                log('statistics open error', e && e.message);
+                notify('Не удалось открыть статистику');
+            }
+        }
+
+        function refreshStatsModal() {
+            if (!statsModalOpen) return;
+            try {
+                var d = doc();
+                var view = d && d.querySelector('.hws-stats');
+                if (view) view.innerHTML = statsMarkup();
+            } catch (e) {
+                log('statistics refresh error', e && e.message);
+            }
+        }
+
         function isMovieWatched(card) {
             if (!isMovieCard(card)) return false;
 
@@ -2015,6 +2312,7 @@
             }
 
             updateBadges();
+            refreshStatsModal();
 
             return Boolean(watched);
         }
@@ -2816,12 +3114,19 @@
             if (!api || typeof api.addComponent !== 'function') return;
 
             var component = 'hide_watched_series';
+            var statsComponent = 'hide_watched_series_stats';
 
             try {
                 api.addComponent({
                     component: component,
                     name: 'Просмотренные сериалы',
                     icon: '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 5h18v11H3z" stroke="white" stroke-width="2"/><path d="M8 20h8" stroke="white" stroke-width="2"/><path d="M8.5 10.5l2.5 2.5 4.5-5" stroke="white" stroke-width="2"/></svg>'
+                });
+
+                api.addComponent({
+                    component: statsComponent,
+                    name: 'Статистика',
+                    icon: '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 19V9m5 10V5m5 14v-7m5 7V3" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>'
                 });
 
                 api.addParam({
@@ -2897,6 +3202,13 @@
                         scheduleWarmup(1000);
                     }
                 });
+
+                api.addParam({
+                    component: statsComponent,
+                    param: { name: 'hws_open_stats', type: 'button' },
+                    field: { name: 'Открыть статистику', description: 'Уникальный контент и известная длительность Timeline' },
+                    onChange: showStats
+                });
             } catch (e) {
                 log('settings error', e && e.message);
             }
@@ -2933,6 +3245,7 @@
             }
 
             scheduleWarmup(5000);
+            refreshStatsModal();
         }
 
         function start() {

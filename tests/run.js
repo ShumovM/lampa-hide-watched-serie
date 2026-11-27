@@ -293,7 +293,7 @@ check('12b', 'Исходные объекты карточек в истории
 });
 
 /* ---------------- 13. Повторная загрузка плагина ---------------- */
-check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 9, true], () => {
+check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 10, true], () => {
     const env = createEnv();
     const api1 = env.install();
     const api2 = env.install();
@@ -1855,6 +1855,48 @@ check('T11', 'Запуск через обёртку передаёт аргум
     const c = env.Lampa.Torrent.calls;
 
     return [c.length, c[0].fn, c[0].movie.id];
+});
+
+/* ---------------- Статистика просмотра ---------------- */
+check('ST1', 'Статистика дедуплицирует эпизоды и фильмы, разделяет аниме и исключает неизвестные записи', {
+    movies: { count: 2, seconds: 5400, missingDuration: 1 },
+    series: { count: 1, episodes: 2, seconds: 1800, missingDuration: 1 },
+    anime: { count: 1, episodes: 1, seconds: 1500, missingDuration: 0 },
+    unclassified: 2,
+    totalSeconds: 8700
+}, () => Core.calculateStats({
+    'episode-title-a': { card: 'tv_10', season: 1, episode: 1, percent: 100, duration: 1800, updated: 100 },
+    'episode-title-b': { card: 'tv_10', season: 1, episode: 1, percent: 100, duration: 1800, updated: 200 },
+    'episode-without-duration': { card: 'tv_10', season: 1, episode: 2, percent: 100, duration: 0, updated: 300 },
+    'anime-episode': { card: 'tv_20', season: 1, episode: 1, percent: 100, duration: 1500, updated: 400 },
+    'movie-timeline': { card: 'movie_5', percent: 100, duration: 5400, updated: 500 },
+    'no-link': { percent: 100, duration: 33, updated: 600 },
+    'unknown-series-metadata': { card: 'tv_30', season: 1, episode: 1, percent: 100, duration: 1200, updated: 650 },
+    'below-threshold': { card: 'tv_10', season: 1, episode: 3, percent: 89, duration: 1200, updated: 700 }
+}, { tmdb_5: { t: 500 }, cub_5: { t: 501 }, tmdb_6: { t: 502 } }, [
+    { id: 10, source: 'tmdb', original_name: 'Drama', original_language: 'en', number_of_seasons: 1 },
+    { id: 20, source: 'tmdb', original_name: 'Anime', original_language: 'ja', number_of_seasons: 1 }
+], 90));
+
+check('ST2', 'Раздел Статистика и экран открываются через SettingsApi в Lampa 2.3.0 и 3.x', [true, true], () => {
+    function checkVersion(version) {
+        const env = fresh({ version });
+        const component = env.Lampa.SettingsApi.components.find((item) => item.component === 'hide_watched_series_stats');
+        const button = env.Lampa.SettingsApi.params.find((item) => item.param.name === 'hws_open_stats');
+        if (!component || !button || typeof button.onChange !== 'function') return false;
+        button.onChange();
+        const modal = env.Lampa.Modal.opened[0];
+        return Boolean(modal && modal.title === 'Статистика просмотра' && modal.html.indexOf('ПРОСМОТРЕНО СЕРИЙ') >= 0 && modal.html.indexOf('не фактическое время перед экраном') >= 0);
+    }
+
+    return [checkVersion('2.3.0'), checkVersion('3.x')];
+});
+
+check('ST3', 'Длительность отображается в днях/часах и неизвестное время не подменяется', ['1 д 1 ч', '0 ч', 'Показаны Timeline активного профиля и локальные отметки фильмов.'], () => {
+    const env = fresh();
+    const button = env.Lampa.SettingsApi.params.find((item) => item.param.name === 'hws_open_stats');
+    button.onChange();
+    return [Core.formatStatsDuration(90000), Core.formatStatsDuration(0), env.Lampa.Modal.opened[0].html.match(/Показаны Timeline[^<]*/)[0]];
 });
 
 /* ---------------- Отчёт ---------------- */

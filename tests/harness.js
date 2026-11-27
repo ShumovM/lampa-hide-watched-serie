@@ -438,6 +438,8 @@ function createEnv(opts) {
             collectionFocus(target, scroll) { this.focus.push({ target, scroll }); }
         },
         Modal: {
+            opened: [],
+            open(options) { this.opened.push(options); },
             scroll() { return { render() { return 'modal-scroll'; } }; }
         },
         // Activity.all(): элементы {component, activity}; refresh() как в 2.3.0/3.x

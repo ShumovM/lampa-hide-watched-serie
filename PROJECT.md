@@ -50,11 +50,14 @@ Timeline-прогресс: в Lampa 3.x — устойчивую карточн�
 прогрессом не показывается. `reconcileStartedFavorites()` пытается снять отметку штатным
 `Favorite.remove('book', card)`; в случае ошибки список ленты всё равно фильтруется по Timeline.
 
-Регистрация адаптирована к разнице API главного экрана: в 3.x `registerFavoriteFeed()` добавляет
-строку через `ContentRows.add()` с индексом после `continue_watch`; в 2.3.0 `patchLegacyMain()`
-оборачивает `Api.sources.tmdb.main()` и `addFavoriteRowToMain()` вставляет строку после Continue,
-если он присутствует. В чистой 2.3.0 штатного Continue на главной нет, поэтому строка ставится после
-первой главной ленты. Данные закладок не копируются в хранилище плагина. При старте и событии
+Регистрация адаптирована к разнице API главного экрана. В 3.x `registerFavoriteFeed()` добавляет
+Favorite через `ContentRows.add()`, но порядок не полагается на `index`: обёртка `patchRows()` после
+штатного `ContentRows.call()` переставляет помеченный callback Favorite в начало, а callback
+штатного Continue — на вторую позицию. Continue распознаётся во время `ContentRows.call()` по
+вызову `Favorite.continues('tv')`; остальные callbacks остаются в изначальном относительном порядке.
+В 2.3.0 `patchLegacyMain()` оборачивает `Api.sources.tmdb.main()`, а
+`addFavoriteRowToMain()` ставит Favorite первым и существующий Continue вторым. В чистой 2.3.0
+штатной строки Continue на главной нет. Данные закладок не копируются в хранилище плагина. При старте и событии
 `Timeline.listener` → `update` выполняется reconciliation; при неудачном снятии отметки начатый
 элемент остаётся скрыт, пока его Timeline-прогресс сохраняется.
 

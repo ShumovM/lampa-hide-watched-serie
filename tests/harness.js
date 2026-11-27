@@ -486,19 +486,21 @@ function createEnv(opts) {
         };
 
         // как favorite.js 3.x: строка с внутренним списком
-        Lampa.ContentRows.add({
-            name: 'continue_watch',
-            index: 1,
-            screen: ['main', 'category'],
-            call: (params, screen) => {
-                const media = screen == 'main' ? 'tv' : params.url;
-                const results = Favorite.continues(media === 'anime' ? 'tv' : media);
+        if (!opts.disableContinueRow) {
+            Lampa.ContentRows.add({
+                name: 'continue_watch',
+                index: 1,
+                screen: ['main', 'category'],
+                call: (params, screen) => {
+                    const media = screen == 'main' ? 'tv' : params.url;
+                    const results = Favorite.continues(media === 'anime' ? 'tv' : media);
 
-                if (!results.length) return;
+                    if (!results.length) return;
 
-                return (call) => call({ results, title: media == 'tv' || media == 'anime' ? 'Продолжить просмотр' : 'Вы смотрели' });
-            }
-        });
+                    return (call) => call({ results, title: media == 'tv' || media == 'anime' ? 'Продолжить просмотр' : 'Вы смотрели' });
+                }
+            });
+        }
 
         Lampa.ContentRows.add({
             name: 'recomend',
@@ -506,6 +508,8 @@ function createEnv(opts) {
             screen: ['main', 'category'],
             call: () => (call) => call({ results: history.slice(), title: 'Рекомендуем посмотреть' })
         });
+
+        (opts.additionalRows || []).forEach((row) => Lampa.ContentRows.add(row));
 
         env.buildScreen = function (screen, params) {
             const calls = [() => 'other'];

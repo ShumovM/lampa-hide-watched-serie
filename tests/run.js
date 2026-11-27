@@ -1578,38 +1578,65 @@ const SERIES = { id: 247718, source: 'tmdb', name: 'MobLand', original_name: 'Mo
 const series = (extra) => Object.assign({}, SERIES, extra || {});
 const TORRENT = { title: 'MobLand S01-02 WEB-DL 1080p', Title: 'MobLand S01-02 WEB-DL 1080p', MagnetUri: 'magnet:?xt=urn:btih:ABC123', Link: 'http://jackett/dl/1' };
 
-/* ---------------- Главная лента штатного избранного ---------------- */
-check('HF1', 'Lampa 3.x: избранное после «Продолжить просмотр», только незапущенные native favorites', ['Продолжить просмотр', 'Избранное', 'Рекомендуем посмотреть', [MOVIE.id, SERIES.id]], () => {
-    const env = fresh({ version: '3.x', favorites: [MOVIE, series()] });
+/* ---------------- Порядок главных лент ---------------- */
+const extraMainRows = () => [
+    { name: 'now', index: 0, screen: ['main'], call: () => (call) => call({ title: 'Сейчас смотрят', results: [MOVIE] }) },
+    { name: 'new_episodes', index: 1, screen: ['main'], call: () => (call) => call({ title: 'Недавние выходы эпизодов', results: [MOVIE] }) },
+    { name: 'shots', index: 2, screen: ['main'], call: () => (call) => call({ title: 'Shots', results: [MOVIE] }) }
+];
+
+check('HF1', 'Lampa 3.x: избранное первым, штатный Continue строго вторым перед ранее зарегистрированными рядами', ['Избранное', 'Продолжить просмотр', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть', [MOVIE.id, SERIES.id]], () => {
+    const env = fresh({ version: '3.x', favorites: [MOVIE, series()], additionalRows: extraMainRows() });
 
     env.history.push(series({ id: 30001, name: 'Продолжается', original_name: 'Continuing' }));
 
     const rows = env.buildScreen('main');
     const favorite = rows.find((row) => row.title === 'Избранное');
 
-    return [rows[0].title, rows[1].title, rows[2].title, favorite.results.map((card) => card.id)];
+    return rows.map((row) => row.title).concat([favorite.results.map((card) => card.id)]);
 });
 
-check('HF2', 'Lampa 2.3.0: legacy main вставляет избранное сразу после штатного Continue', ['Продолжить просмотр', 'Избранное', 'Популярное'], () => {
+check('HF2', 'Lampa 2.3.0: избранное первым, штатный Continue вторым независимо от начального положения', ['Избранное', 'Продолжить просмотр', 'Популярное', 'Shots'], () => {
     const env = fresh({
         version: '2.3.0',
         favorites: [MOVIE],
         mainRows: [
+            { title: 'Популярное', results: [] },
             { title: 'Продолжить просмотр', results: [] },
-            { title: 'Популярное', results: [] }
+            { title: 'Shots', results: [] }
         ]
     });
 
     return env.buildScreen('main').map((row) => row.title);
 });
 
-check('HF3', 'Lampa 2.3.0 без Continue на главной: избранное вставляется после первой штатной ленты', ['Сейчас смотрят', 'Избранное'], () => {
+check('HF3', 'Lampa 2.3.0 без Continue на главной: избранное первым, штатные ряды сохраняют порядок', ['Избранное', 'Сейчас смотрят'], () => {
     const env = fresh({ version: '2.3.0', favorites: [MOVIE] });
 
-    return env.buildScreen('main').slice(0, 2).map((row) => row.title);
+    return env.buildScreen('main').map((row) => row.title);
 });
 
-check('HF4', 'Начало просмотра серии удаляет избранное, но оставляет сериал в штатной истории; при ошибке удаления лента всё равно скрывает его', [1, 2, 1, true, null], () => {
+check('HF4', 'Lampa 3.x без штатного Continue-ряда: избранное первым, сторонние ряды не переставляются', ['Избранное', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть'], () => {
+    const env = fresh({ version: '3.x', favorites: [MOVIE], disableContinueRow: true, additionalRows: extraMainRows() });
+
+    return env.buildScreen('main').map((row) => row.title);
+});
+
+check('HF5', 'Lampa 3.x без записей Continue: избранное первым, следующий обычный ряд остаётся вторым', ['Избранное', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть'], () => {
+    const env = fresh({ version: '3.x', favorites: [MOVIE], additionalRows: extraMainRows() });
+
+    return env.buildScreen('main').map((row) => row.title);
+});
+
+check('HF6', 'Lampa 3.x без избранного: штатный Continue автоматически становится первым рядом', ['Продолжить просмотр', 'Сейчас смотрят', 'Недавние выходы эпизодов', 'Shots', 'Рекомендуем посмотреть'], () => {
+    const env = fresh({ version: '3.x', additionalRows: extraMainRows() });
+
+    env.history.push(series({ id: 30002, name: 'Продолжается', original_name: 'Continuing' }));
+
+    return env.buildScreen('main').map((row) => row.title);
+});
+
+check('HF7', 'Начало просмотра серии удаляет избранное, но оставляет сериал в штатной истории; при ошибке удаления лента всё равно скрывает его', [1, 2, 1, true, null], () => {
     const env = fresh({ version: '2.3.0', favorites: [series(), MOVIE], favoriteRemoveFails: true });
     const card = series();
 
@@ -1623,7 +1650,7 @@ check('HF4', 'Начало просмотра серии удаляет избр
     return [env.favoriteRemovals.length, env.favorites.length, favoriteRow.results.length, categoryContinue.indexOf('MobLand') >= 0, env.ls.getItem('hws_favorites')];
 });
 
-check('HF5', 'Lampa 3.x: Timeline link обнаруживает начатый фильм и снимает native favorite', [0, 1], () => {
+check('HF8', 'Lampa 3.x: Timeline link обнаруживает начатый фильм и снимает native favorite', [0, 1], () => {
     const env = fresh({ version: '3.x', favorites: [MOVIE] });
 
     env.Lampa.Timeline.update({ hash: 'movie-progress', percent: 4, card: 'movie_27205', updated: env.now() });

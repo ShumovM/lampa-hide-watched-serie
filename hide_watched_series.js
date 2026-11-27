@@ -3091,9 +3091,9 @@
         }
 
         /**
-         * Lampa 3.x: строка регистрируется через ContentRows.add, список строит
-         * внутренняя функция favorite.js. Подменяем ответ только у строки,
-         * чей заголовок — «Продолжить просмотр».
+         * Lampa 3.x: ContentRows.call сначала формирует полный список callback-ов
+         * по индексам зарегистрированных строк. После этого приоритетные строки
+         * переставляются на первые позиции, не меняя порядок остальных.
          */
         function patchRows() {
             var rows = L().ContentRows;
@@ -3105,7 +3105,50 @@
 
             var wrapped = function (screen, params, calls) {
                 var before = isArray(calls) ? calls.slice() : null;
-                var result = original.apply(this, arguments);
+                var favorite = L().Favorite;
+                var originalContinues = favorite && favorite.continues;
+                var originalSplice = before ? calls.splice : null;
+                var hadOwnSplice = before && Object.prototype.hasOwnProperty.call(calls, 'splice');
+                var continuePending = false;
+                var main = screen === 'main';
+                var result;
+
+                if (main && before && typeof originalContinues === 'function') {
+                    favorite.continues = function (type) {
+                        var items = originalContinues.apply(this, arguments);
+
+                        if (type === 'tv' && isArray(items) && items.length) continuePending = true;
+
+                        return items;
+                    };
+
+                    calls.splice = function () {
+                        var args = Array.prototype.slice.call(arguments);
+                        var inserted = args.slice(2);
+
+                        if (continuePending) {
+                            for (var i = 0; i < inserted.length; i++) {
+                                if (typeof inserted[i] === 'function') {
+                                    inserted[i].__hws_native_continue_row = true;
+                                    continuePending = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        return originalSplice.apply(this, args);
+                    };
+                }
+
+                try {
+                    result = original.apply(this, arguments);
+                } finally {
+                    if (main && before) {
+                        if (hadOwnSplice) calls.splice = originalSplice;
+                        else delete calls.splice;
+                        if (favorite && typeof originalContinues === 'function') favorite.continues = originalContinues;
+                    }
+                }
 
                 if (before && (screen === 'main' || screen === 'category')) {
                     for (var i = 0; i < calls.length; i++) {
@@ -3114,6 +3157,8 @@
                         if (typeof fn === 'function' && !fn.__hws_row && before.indexOf(fn) === -1) calls[i] = wrapRow(fn, screen);
                     }
                 }
+
+                if (main && isArray(calls)) prioritizeMainRows(calls);
 
                 return result;
             };
@@ -3124,6 +3169,26 @@
             log('rows mode');
 
             return true;
+        }
+
+        function prioritizeMainRows(calls) {
+            var favorite = [];
+            var continued = [];
+            var rest = [];
+
+            for (var i = 0; i < calls.length; i++) {
+                var call = calls[i];
+
+                if (call && call.__hws_favorite_feed_row) favorite.push(call);
+                else if (call && call.__hws_native_continue_row) continued.push(call);
+                else rest.push(call);
+            }
+
+            var ordered = favorite.concat(continued, rest);
+
+            if (ordered.length !== calls.length) return;
+
+            calls.splice.apply(calls, [0, calls.length].concat(ordered));
         }
 
         function continueTitle() {
@@ -3154,6 +3219,8 @@
             };
 
             wrapped.__hws_row = true;
+            if (fn.__hws_favorite_feed_row) wrapped.__hws_favorite_feed_row = true;
+            if (fn.__hws_native_continue_row) wrapped.__hws_native_continue_row = true;
 
             return wrapped;
         }
@@ -3313,45 +3380,30 @@
         function favoriteFeedRow() {
             var results = favoriteFeedItems();
 
-            return results.length ? { title: 'Избранное', results: results } : null;
+            if (!results.length) return null;
+
+            var row = { title: 'Избранное', results: results };
+            row.__hws_favorite_feed = true;
+
+            return row;
         }
 
         function addFavoriteRowToMain(rows) {
             if (!isArray(rows)) return rows;
 
             var result = rows.slice();
-            var position = -1;
+            var continueRow = null;
+            var title = continueTitle();
 
-            for (var i = 0; i < result.length; i++) {
-                if (result[i] && result[i].title === 'Избранное') {
-                    position = i;
-                    break;
-                }
+            for (var i = result.length - 1; i >= 0; i--) {
+                if (result[i] && result[i].__hws_favorite_feed) result.splice(i, 1);
+                else if (!continueRow && title && result[i] && result[i].title === title) continueRow = result.splice(i, 1)[0];
             }
-
-            if (position >= 0) result.splice(position, 1);
 
             var row = favoriteFeedRow();
 
-            if (!row) return result;
-
-            var title = continueTitle();
-            position = -1;
-
-            if (title) {
-                for (i = 0; i < result.length; i++) {
-                    if (result[i] && result[i].title === title) {
-                        position = i + 1;
-                        break;
-                    }
-                }
-            }
-
-            // Lampa 2.3.0 does not ship a Continue row on its home page. If another
-            // plugin adds one to the main result, use it as the anchor; otherwise
-            // place Favorites immediately after the first native home row.
-            if (position < 0) position = Math.min(1, result.length);
-            result.splice(position, 0, row);
+            if (row) result.unshift(row);
+            if (continueRow) result.splice(row ? 1 : 0, 0, continueRow);
 
             return result;
         }
@@ -3388,14 +3440,17 @@
                     rows.add({
                         name: 'hws_favorites',
                         title: 'Избранное',
-                        index: 2,
+                        index: 0,
                         screen: ['main'],
                         call: function () {
                             var row = favoriteFeedRow();
 
                             if (!row) return;
 
-                            return function (call) { call(row); };
+                            var feedCall = function (call) { call(row); };
+                            feedCall.__hws_favorite_feed_row = true;
+
+                            return feedCall;
                         }
                     });
                     favoriteFeedRegistered = true;

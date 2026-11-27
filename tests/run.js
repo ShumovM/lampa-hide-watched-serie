@@ -293,7 +293,7 @@ check('12b', 'Исходные объекты карточек в истории
 });
 
 /* ---------------- 13. Повторная загрузка плагина ---------------- */
-check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 10, true], () => {
+check('13', 'Повторная загрузка: одна обёртка, один обработчик Timeline, одни настройки', [true, true, 1, 12, true], () => {
     const env = createEnv();
     const api1 = env.install();
     const api2 = env.install();
@@ -1963,6 +1963,38 @@ check('T11', 'Запуск через обёртку передаёт аргум
 });
 
 /* ---------------- Статистика просмотра ---------------- */
+/* ---------------- Диагностика Supabase Sync ---------------- */
+check('SD1', 'Проверка Supabase выполняет авторизованный health и read-only sync', ['connected', ['health', 'sync']], () => {
+    const env = createEnv();
+    const calls = [];
+    env.install({ syncRequest(url, code, body, cb) { calls.push(body.action); cb(null, body.action === 'health' ? { success: true } : { success: true, data: { episode_progress: [], movie_watched_marks: [], series_torrent_resume: [] } }); } });
+    env.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); env.Lampa.Storage.set('hws_sync_code', 'secret');
+    env.win.HideWatchedSeries.syncCheck();
+    return [env.win.HideWatchedSeries.syncStatus().status, calls];
+});
+
+check('SD2', 'Пустые настройки сообщают «Не настроено»', 'not_configured', () => {
+    const env = fresh(); env.win.HideWatchedSeries.syncCheck(); return env.win.HideWatchedSeries.syncStatus().status;
+});
+
+check('SD3', 'Недоступный сервер и timeout сохраняются как диагностическая ошибка', ['unavailable', 'Таймаут соединения'], () => {
+    const env = createEnv(); env.install({ syncRequest(url, code, body, cb) { cb('timeout'); } }); env.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); env.Lampa.Storage.set('hws_sync_code', 'secret'); env.win.HideWatchedSeries.syncCheck();
+    return [env.win.HideWatchedSeries.syncStatus().status, env.win.HideWatchedSeries.syncStatus().error];
+});
+
+check('SD4', '401 классифицируется как ошибка авторизации, некорректный ответ — как ошибка формата', ['auth_error', 'sync_error'], () => {
+    const env = createEnv(); env.install({ syncRequest(url, code, body, cb) { cb(null, { success: true }); } }); env.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); env.Lampa.Storage.set('hws_sync_code', 'secret'); env.win.HideWatchedSeries.syncCheck();
+    const malformed = env.win.HideWatchedSeries.syncStatus().status;
+    const env2 = createEnv(); env2.install({ syncRequest(url, code, body, cb) { cb('unauthorized'); } }); env2.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); env2.Lampa.Storage.set('hws_sync_code', 'secret'); env2.win.HideWatchedSeries.syncCheck();
+    return [env2.win.HideWatchedSeries.syncStatus().status, malformed];
+});
+
+check('SD5', 'Диагностика сохраняется после переустановки плагина', true, () => {
+    const env = createEnv(); env.install({ syncRequest(url, code, body, cb) { cb('network'); } }); env.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); env.Lampa.Storage.set('hws_sync_code', 'secret'); env.win.HideWatchedSeries.syncCheck();
+    const restarted = createEnv({ localStorage: env.ls }); restarted.Lampa.Storage.set('hws_sync_url', 'https://example.supabase.co'); restarted.Lampa.Storage.set('hws_sync_code', 'secret'); restarted.install();
+    return Boolean(restarted.win.HideWatchedSeries.syncStatus().error);
+});
+
 check('ST1', 'Статистика дедуплицирует эпизоды и фильмы, разделяет аниме и исключает неизвестные записи', {
     movies: { count: 2, seconds: 5400, missingDuration: 1 },
     series: { count: 1, episodes: 2, seconds: 1800, missingDuration: 1 },
